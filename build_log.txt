@@ -1,0 +1,16 @@
+[Jello Test] Building with OpenGL backend...
+backends/stygian_ap_gl.c:16:9: warning: unknown pragma ignored [-Wunknown-pragmas]
+   16 | #pragma comment(lib, "opengl32.lib")
+      |         ^
+backends/stygian_ap_gl.c:17:9: warning: unknown pragma ignored [-Wunknown-pragmas]
+   17 | #pragma comment(lib, "gdi32.lib")
+      |         ^
+backends/stygian_ap_gl.c:18:9: warning: unknown pragma ignored [-Wunknown-pragmas]
+   18 | #pragma comment(lib, "dwmapi.lib")
+      |         ^
+3 warnings generated.
+ld.lld: error: undefined symbol: WinMain
+>>> referenced by C:/M/B/src/mingw-w64/mingw-w64-crt/crt/crtexewin.c:66
+>>>               libmingw32.a(lib64_libmingw32_a-crtexewin.o):(main)
+clang: error: linker command failed with exit code 1 (use -v to see invocation)
+[ERROR] Build failed

@@ -19,7 +19,12 @@ extern "C" {
 // ============================================================================
 
 typedef struct StygianWindow StygianWindow;
-typedef struct StygianGPUElement StygianGPUElement;
+
+typedef struct StygianAllocator StygianAllocator;
+typedef struct StygianSoAHot StygianSoAHot;
+typedef struct StygianSoAAppearance StygianSoAAppearance;
+typedef struct StygianSoAEffects StygianSoAEffects;
+typedef struct StygianBufferChunk StygianBufferChunk;
 
 // ============================================================================
 // Access Point Handle
@@ -42,10 +47,11 @@ typedef enum StygianAPType {
 
 typedef struct StygianAPConfig {
   StygianAPType type;
-  StygianWindow *window;  // Required: window for context creation
-  uint32_t max_elements;  // Max elements in SSBO/UBO
-  uint32_t max_textures;  // Max texture slots
-  const char *shader_dir; // Path to shader files (for hot reload)
+  StygianWindow *window;       // Required: window for context creation
+  uint32_t max_elements;       // Max elements in SSBO/UBO
+  uint32_t max_textures;       // Max texture slots
+  const char *shader_dir;      // Path to shader files (for hot reload)
+  StygianAllocator *allocator; // Optional: defaults to CRT allocator
 } StygianAPConfig;
 
 // ============================================================================
@@ -61,6 +67,8 @@ void stygian_ap_destroy(StygianAP *ap);
 
 // Query adapter class selected by backend (for policy decisions in core).
 StygianAPAdapterClass stygian_ap_get_adapter_class(const StygianAP *ap);
+uint32_t stygian_ap_get_last_upload_bytes(const StygianAP *ap);
+uint32_t stygian_ap_get_last_upload_ranges(const StygianAP *ap);
 
 // ============================================================================
 // Multi-Surface (for floating windows, additional viewports)
@@ -83,8 +91,7 @@ void stygian_ap_surface_begin(StygianAP *ap, StygianAPSurface *surface,
 
 // Submit elements to a surface (updates SSBO and issues draw call)
 void stygian_ap_surface_submit(StygianAP *ap, StygianAPSurface *surface,
-                               const StygianGPUElement *elements,
-                               uint32_t count);
+                               const StygianSoAHot *soa_hot, uint32_t count);
 
 // End rendering to a surface (records commands)
 void stygian_ap_surface_end(StygianAP *ap, StygianAPSurface *surface);
@@ -102,14 +109,23 @@ StygianAPSurface *stygian_ap_get_main_surface(StygianAP *ap);
 // Begin frame - sets up viewport, clears, binds program
 void stygian_ap_begin_frame(StygianAP *ap, int width, int height);
 
-// Submit elements for rendering
-// The AP does NOT own this memory - Core owns it
-void stygian_ap_submit(StygianAP *ap, const StygianGPUElement *elements,
-                       uint32_t count, const uint32_t *dirty_ids,
-                       uint32_t dirty_count);
+// Texture handle→sampler remapping + bind for the active batch.
+void stygian_ap_submit(StygianAP *ap, const StygianSoAHot *soa_hot,
+                       uint32_t count);
+
+// Submit SoA buffers with versioned chunk upload
+// Compares CPU chunk versions against GPU versions; uploads only dirty ranges
+void stygian_ap_submit_soa(StygianAP *ap, const StygianSoAHot *hot,
+                           const StygianSoAAppearance *appearance,
+                           const StygianSoAEffects *effects,
+                           uint32_t element_count,
+                           const StygianBufferChunk *chunks,
+                           uint32_t chunk_count, uint32_t chunk_size);
 
 // Issue draw call for the most recently submitted batch
 void stygian_ap_draw(StygianAP *ap);
+void stygian_ap_draw_range(StygianAP *ap, uint32_t first_instance,
+                           uint32_t instance_count);
 
 // End frame - finalize frame (no draw for GL; ends command buffer for VK)
 void stygian_ap_end_frame(StygianAP *ap);
@@ -165,12 +181,9 @@ void stygian_ap_set_font_texture(StygianAP *ap, StygianAPTexture tex,
 
 // Set output color transform applied in fragment shader.
 // rgb3x3 is row-major source-linear RGB -> destination-linear RGB matrix.
-void stygian_ap_set_output_color_transform(StygianAP *ap, bool enabled,
-                                           const float *rgb3x3,
-                                           bool src_srgb_transfer,
-                                           float src_gamma,
-                                           bool dst_srgb_transfer,
-                                           float dst_gamma);
+void stygian_ap_set_output_color_transform(
+    StygianAP *ap, bool enabled, const float *rgb3x3, bool src_srgb_transfer,
+    float src_gamma, bool dst_srgb_transfer, float dst_gamma);
 
 // ============================================================================
 // Clip Regions

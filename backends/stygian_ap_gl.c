@@ -2,6 +2,8 @@
 // Part of Stygian UI Library
 // DISCIPLINE: Only GPU operations. No layout, no fonts, no hit testing.
 #include "../include/stygian.h" // For StygianGPUElement
+#include "../include/stygian_memory.h"
+#include "../src/stygian_internal.h" // For SoA struct types
 #include "../window/stygian_window.h"
 #include "stygian_ap.h"
 
@@ -17,7 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef _WIN32
+#ifdef _MSC_VER
 #pragma comment(lib, "opengl32.lib")
 #pragma comment(lib, "gdi32.lib")
 #endif
@@ -145,6 +147,8 @@ typedef void (*PFNGLVERTEXATTRIBPOINTERPROC)(GLuint, GLint, GLenum, GLboolean,
 typedef void (*PFNGLGENVERTEXARRAYSPROC)(GLsizei, GLuint *);
 typedef void (*PFNGLBINDVERTEXARRAYPROC)(GLuint);
 typedef void (*PFNGLDRAWARRAYSINSTANCEDPROC)(GLenum, GLint, GLsizei, GLsizei);
+typedef void (*PFNGLDRAWARRAYSINSTANCEDBASEINSTANCEPROC)(GLenum, GLint, GLsizei,
+                                                         GLsizei, GLuint);
 typedef void (*PFNGLDELETEBUFFERSPROC)(GLsizei, const GLuint *);
 typedef void (*PFNGLDELETEPROGRAMPROC)(GLuint);
 typedef void (*PFNGLACTIVETEXTUREPROC)(GLenum);
@@ -176,6 +180,8 @@ static PFNGLVERTEXATTRIBPOINTERPROC glVertexAttribPointer;
 static PFNGLGENVERTEXARRAYSPROC glGenVertexArrays;
 static PFNGLBINDVERTEXARRAYPROC glBindVertexArray;
 static PFNGLDRAWARRAYSINSTANCEDPROC glDrawArraysInstanced;
+static PFNGLDRAWARRAYSINSTANCEDBASEINSTANCEPROC
+    glDrawArraysInstancedBaseInstance;
 static PFNGLDELETEBUFFERSPROC glDeleteBuffers;
 static PFNGLDELETEPROGRAMPROC glDeleteProgram;
 static PFNGLACTIVETEXTUREPROC glActiveTexture;
@@ -198,11 +204,12 @@ static void load_gl(void **ptr, const char *name) {
 struct StygianAP {
   StygianWindow *window;
   uint32_t max_elements;
+  StygianAllocator *allocator;
 
   void *gl_context;
 
   // GPU resources
-  GLuint ssbo;
+  GLuint clip_ssbo;
   GLuint vao;
   GLuint vbo;
   GLuint program;
@@ -237,12 +244,61 @@ struct StygianAP {
   // Shader file modification times for auto-reload
   uint64_t shader_load_time; // Time when shaders were last loaded
 
-  // CPU remap buffer so STYGIAN_TEXTURE can index sampler array by small slots.
-  StygianGPUElement *submit_buffer;
+  uint32_t last_upload_bytes;
+  uint32_t last_upload_ranges;
+
+  // SoA SSBOs (3 buffers: hot, appearance, effects)
+  GLuint soa_ssbo_hot;
+  GLuint soa_ssbo_appearance;
+  GLuint soa_ssbo_effects;
+  // GPU-side version tracking per chunk
+  uint32_t *gpu_hot_versions;
+  uint32_t *gpu_appearance_versions;
+  uint32_t *gpu_effects_versions;
+  uint32_t soa_chunk_count;
+
+  // Remapped hot stream submitted to GPU (texture handles -> sampler slots).
+  StygianSoAHot *submit_hot;
 };
 
 #define STYGIAN_GL_IMAGE_SAMPLERS 16
-#define STYGIAN_GL_IMAGE_UNIT_BASE 2
+#define STYGIAN_GL_IMAGE_UNIT_BASE 2 // units 0,1 reserved for font atlas etc.
+
+// Safe string copy: deterministic, no printf overhead, always NUL-terminates.
+// copy_cstr removed — use stygian_cpystr from stygian_internal.h
+
+// Allocator helpers: use AP allocator when set, else CRT (bootstrap/fallback)
+static void *ap_alloc(StygianAP *ap, size_t size, size_t alignment) {
+  if (ap->allocator && ap->allocator->alloc)
+    return ap->allocator->alloc(ap->allocator, size, alignment);
+  (void)alignment;
+  return malloc(size);
+}
+static void ap_free(StygianAP *ap, void *ptr) {
+  if (!ptr)
+    return;
+  if (ap->allocator && ap->allocator->free)
+    ap->allocator->free(ap->allocator, ptr);
+  else
+    free(ptr);
+}
+
+// Config-based allocator helpers for bootstrap (before AP struct exists)
+static void *cfg_alloc(StygianAllocator *allocator, size_t size,
+                       size_t alignment) {
+  if (allocator && allocator->alloc)
+    return allocator->alloc(allocator, size, alignment);
+  (void)alignment;
+  return malloc(size);
+}
+static void cfg_free(StygianAllocator *allocator, void *ptr) {
+  if (!ptr)
+    return;
+  if (allocator && allocator->free)
+    allocator->free(allocator, ptr);
+  else
+    free(ptr);
+}
 
 static bool contains_nocase(const char *haystack, const char *needle) {
   size_t nlen;
@@ -284,15 +340,22 @@ static StygianAPAdapterClass classify_renderer(const char *renderer) {
 // File Modification Time (for shader hot-reload)
 // ============================================================================
 
+// Portable file modification time
+#ifdef _WIN32
+#include <sys/stat.h>
+#include <sys/types.h>
+#else
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#endif
+
 // Get file modification time as uint64 (0 on error)
 static uint64_t get_file_mod_time(const char *path) {
 #ifdef _WIN32
-  WIN32_FILE_ATTRIBUTE_DATA data;
-  if (GetFileAttributesExA(path, GetFileExInfoStandard, &data)) {
-    ULARGE_INTEGER uli;
-    uli.LowPart = data.ftLastWriteTime.dwLowDateTime;
-    uli.HighPart = data.ftLastWriteTime.dwHighDateTime;
-    return uli.QuadPart;
+  struct _stat st;
+  if (_stat(path, &st) == 0) {
+    return (uint64_t)st.st_mtime;
   }
 #else
   struct stat st;
@@ -344,16 +407,14 @@ static GLuint compile_shader(GLenum type, const char *source) {
 
 // Load preprocessed shader file from build/ subdirectory
 // Shaders are preprocessed by shaderc (glslc -E) to resolve #includes
-static char *load_shader_file(const char *shader_dir, const char *filename) {
+static char *load_shader_file(StygianAP *ap, const char *filename) {
   char path[512];
-  // Load from build/ subdirectory (preprocessed by shaderc)
-  snprintf(path, sizeof(path), "%s/build/%s.glsl", shader_dir, filename);
+  snprintf(path, sizeof(path), "%s/build/%s.glsl", ap->shader_dir, filename);
 
   FILE *f = fopen(path, "rb");
   if (!f) {
     printf("[Stygian AP] Shader not found at '%s', trying fallback...\n", path);
-    // Try source file as fallback for development
-    snprintf(path, sizeof(path), "%s/%s", shader_dir, filename);
+    snprintf(path, sizeof(path), "%s/%s", ap->shader_dir, filename);
     f = fopen(path, "rb");
   }
   if (!f) {
@@ -366,13 +427,13 @@ static char *load_shader_file(const char *shader_dir, const char *filename) {
   long size = ftell(f);
   fseek(f, 0, SEEK_SET);
 
-  char *source = (char *)malloc(size + 1);
+  char *source = (char *)ap_alloc(ap, (size_t)size + 1u, 1);
   if (!source) {
     fclose(f);
     return NULL;
   }
 
-  fread(source, 1, size, f);
+  fread(source, 1, (size_t)size, f);
   source[size] = '\0';
   fclose(f);
 
@@ -381,35 +442,28 @@ static char *load_shader_file(const char *shader_dir, const char *filename) {
 
 // Compile and link shader program, returns program handle or 0 on failure
 // Does NOT modify ap->program - caller decides what to do with result
-static GLuint compile_program_internal(const char *shader_dir,
-                                       GLint *out_loc_screen_size,
-                                       GLint *out_loc_font_tex,
-                                       GLint *out_loc_image_tex,
-                                       GLint *out_loc_atlas_size,
-                                       GLint *out_loc_px_range,
-                                       GLint *out_loc_output_transform_enabled,
-                                       GLint *out_loc_output_matrix,
-                                       GLint *out_loc_output_src_srgb,
-                                       GLint *out_loc_output_src_gamma,
-                                       GLint *out_loc_output_dst_srgb,
-                                       GLint *out_loc_output_dst_gamma) {
-  // Load vertex shader from file
-  char *vert_src = load_shader_file(shader_dir, "stygian.vert");
+static GLuint compile_program_internal(
+    StygianAP *ap, GLint *out_loc_screen_size, GLint *out_loc_font_tex,
+    GLint *out_loc_image_tex, GLint *out_loc_atlas_size,
+    GLint *out_loc_px_range, GLint *out_loc_output_transform_enabled,
+    GLint *out_loc_output_matrix, GLint *out_loc_output_src_srgb,
+    GLint *out_loc_output_src_gamma, GLint *out_loc_output_dst_srgb,
+    GLint *out_loc_output_dst_gamma) {
+  char *vert_src = load_shader_file(ap, "stygian.vert");
   if (!vert_src)
     return 0;
 
-  // Load fragment shader from file (with #include processing)
-  char *frag_src = load_shader_file(shader_dir, "stygian.frag");
+  char *frag_src = load_shader_file(ap, "stygian.frag");
   if (!frag_src) {
-    free(vert_src);
+    ap_free(ap, vert_src);
     return 0;
   }
 
   GLuint vs = compile_shader(GL_VERTEX_SHADER, vert_src);
   GLuint fs = compile_shader(GL_FRAGMENT_SHADER, frag_src);
 
-  free(vert_src);
-  free(frag_src);
+  ap_free(ap, vert_src);
+  ap_free(ap, frag_src);
 
   if (!vs || !fs) {
     if (vs)
@@ -463,26 +517,31 @@ static GLuint compile_program_internal(const char *shader_dir,
     *out_loc_output_transform_enabled =
         glGetUniformLocation(program, "uOutputColorTransformEnabled");
   if (out_loc_output_matrix)
-    *out_loc_output_matrix = glGetUniformLocation(program, "uOutputColorMatrix");
+    *out_loc_output_matrix =
+        glGetUniformLocation(program, "uOutputColorMatrix");
   if (out_loc_output_src_srgb)
-    *out_loc_output_src_srgb = glGetUniformLocation(program, "uOutputSrcIsSRGB");
+    *out_loc_output_src_srgb =
+        glGetUniformLocation(program, "uOutputSrcIsSRGB");
   if (out_loc_output_src_gamma)
-    *out_loc_output_src_gamma = glGetUniformLocation(program, "uOutputSrcGamma");
+    *out_loc_output_src_gamma =
+        glGetUniformLocation(program, "uOutputSrcGamma");
   if (out_loc_output_dst_srgb)
-    *out_loc_output_dst_srgb = glGetUniformLocation(program, "uOutputDstIsSRGB");
+    *out_loc_output_dst_srgb =
+        glGetUniformLocation(program, "uOutputDstIsSRGB");
   if (out_loc_output_dst_gamma)
-    *out_loc_output_dst_gamma = glGetUniformLocation(program, "uOutputDstGamma");
+    *out_loc_output_dst_gamma =
+        glGetUniformLocation(program, "uOutputDstGamma");
 
   return program;
 }
 
 static bool create_program(StygianAP *ap) {
   GLuint program = compile_program_internal(
-      ap->shader_dir, &ap->loc_screen_size, &ap->loc_font_tex,
-      &ap->loc_image_tex, &ap->loc_atlas_size, &ap->loc_px_range,
-      &ap->loc_output_transform_enabled, &ap->loc_output_matrix,
-      &ap->loc_output_src_srgb, &ap->loc_output_src_gamma,
-      &ap->loc_output_dst_srgb, &ap->loc_output_dst_gamma);
+      ap, &ap->loc_screen_size, &ap->loc_font_tex, &ap->loc_image_tex,
+      &ap->loc_atlas_size, &ap->loc_px_range, &ap->loc_output_transform_enabled,
+      &ap->loc_output_matrix, &ap->loc_output_src_srgb,
+      &ap->loc_output_src_gamma, &ap->loc_output_dst_srgb,
+      &ap->loc_output_dst_gamma);
 
   if (!program)
     return false;
@@ -505,15 +564,13 @@ static void upload_output_color_transform_uniforms(StygianAP *ap) {
                        ap->output_color_matrix);
   }
   if (ap->loc_output_src_srgb >= 0) {
-    glUniform1i(ap->loc_output_src_srgb,
-                ap->output_src_srgb_transfer ? 1 : 0);
+    glUniform1i(ap->loc_output_src_srgb, ap->output_src_srgb_transfer ? 1 : 0);
   }
   if (ap->loc_output_src_gamma >= 0) {
     glUniform1f(ap->loc_output_src_gamma, ap->output_src_gamma);
   }
   if (ap->loc_output_dst_srgb >= 0) {
-    glUniform1i(ap->loc_output_dst_srgb,
-                ap->output_dst_srgb_transfer ? 1 : 0);
+    glUniform1i(ap->loc_output_dst_srgb, ap->output_dst_srgb_transfer ? 1 : 0);
   }
   if (ap->loc_output_dst_gamma >= 0) {
     glUniform1f(ap->loc_output_dst_gamma, ap->output_dst_gamma);
@@ -530,9 +587,12 @@ StygianAP *stygian_ap_create(const StygianAPConfig *config) {
     return NULL;
   }
 
-  StygianAP *ap = (StygianAP *)calloc(1, sizeof(StygianAP));
+  StygianAP *ap = (StygianAP *)cfg_alloc(config->allocator, sizeof(StygianAP),
+                                         _Alignof(StygianAP));
   if (!ap)
     return NULL;
+  memset(ap, 0, sizeof(StygianAP));
+  ap->allocator = config->allocator;
   ap->adapter_class = STYGIAN_AP_ADAPTER_UNKNOWN;
 
   ap->window = config->window;
@@ -548,30 +608,28 @@ StygianAP *stygian_ap_create(const StygianAPConfig *config) {
   ap->output_color_matrix[8] = 1.0f;
 
   // Copy shader directory (already resolved by core)
-  if (config->shader_dir && config->shader_dir[0]) {
-    strncpy(ap->shader_dir, config->shader_dir, sizeof(ap->shader_dir) - 1);
-    ap->shader_dir[sizeof(ap->shader_dir) - 1] = '\0';
-  } else {
-    strncpy(ap->shader_dir, "shaders", sizeof(ap->shader_dir) - 1);
-  }
+  stygian_cpystr(ap->shader_dir, sizeof(ap->shader_dir),
+                 (config->shader_dir && config->shader_dir[0])
+                     ? config->shader_dir
+                     : "shaders");
 
   if (!stygian_window_gl_set_pixel_format(config->window)) {
     printf("[Stygian AP] Failed to set pixel format\n");
-    free(ap);
+    cfg_free(config->allocator, ap);
     return NULL;
   }
 
   ap->gl_context = stygian_window_gl_create_context(config->window, NULL);
   if (!ap->gl_context) {
     printf("[Stygian AP] Failed to create OpenGL context\n");
-    free(ap);
+    cfg_free(config->allocator, ap);
     return NULL;
   }
 
   if (!stygian_window_gl_make_current(config->window, ap->gl_context)) {
     printf("[Stygian AP] Failed to make OpenGL context current\n");
     stygian_window_gl_destroy_context(ap->gl_context);
-    free(ap);
+    cfg_free(config->allocator, ap);
     return NULL;
   }
 
@@ -606,6 +664,7 @@ StygianAP *stygian_ap_create(const StygianAPConfig *config) {
   LOAD_GL(glGenVertexArrays);
   LOAD_GL(glBindVertexArray);
   LOAD_GL(glDrawArraysInstanced);
+  LOAD_GL(glDrawArraysInstancedBaseInstance);
   LOAD_GL(glDeleteBuffers);
   LOAD_GL(glDeleteProgram);
   LOAD_GL(glActiveTexture);
@@ -636,18 +695,59 @@ StygianAP *stygian_ap_create(const StygianAPConfig *config) {
     return NULL;
   }
 
-  // Create SSBO for elements
-  glGenBuffers(1, &ap->ssbo);
-  glBindBuffer(GL_SHADER_STORAGE_BUFFER, ap->ssbo);
-  glBufferData(GL_SHADER_STORAGE_BUFFER,
-               ap->max_elements * sizeof(StygianGPUElement), NULL,
-               GL_DYNAMIC_DRAW);
-  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ap->ssbo);
+  // Create SSBO for clip rects (binding 3)
+  glGenBuffers(1, &ap->clip_ssbo);
+  glBindBuffer(GL_SHADER_STORAGE_BUFFER, ap->clip_ssbo);
+  glBufferData(GL_SHADER_STORAGE_BUFFER, STYGIAN_MAX_CLIPS * sizeof(float) * 4,
+               NULL, GL_DYNAMIC_DRAW);
+  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, ap->clip_ssbo);
 
-  ap->submit_buffer =
-      (StygianGPUElement *)malloc(ap->max_elements * sizeof(StygianGPUElement));
-  if (!ap->submit_buffer) {
-    printf("[Stygian AP] Failed to allocate submit buffer\n");
+  // Create SoA SSBOs (bindings 4, 5, 6)
+  glGenBuffers(1, &ap->soa_ssbo_hot);
+  glBindBuffer(GL_SHADER_STORAGE_BUFFER, ap->soa_ssbo_hot);
+  glBufferData(GL_SHADER_STORAGE_BUFFER,
+               ap->max_elements * sizeof(StygianSoAHot), NULL, GL_DYNAMIC_DRAW);
+  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, ap->soa_ssbo_hot);
+
+  glGenBuffers(1, &ap->soa_ssbo_appearance);
+  glBindBuffer(GL_SHADER_STORAGE_BUFFER, ap->soa_ssbo_appearance);
+  glBufferData(GL_SHADER_STORAGE_BUFFER,
+               ap->max_elements * sizeof(StygianSoAAppearance), NULL,
+               GL_DYNAMIC_DRAW);
+  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, ap->soa_ssbo_appearance);
+
+  glGenBuffers(1, &ap->soa_ssbo_effects);
+  glBindBuffer(GL_SHADER_STORAGE_BUFFER, ap->soa_ssbo_effects);
+  glBufferData(GL_SHADER_STORAGE_BUFFER,
+               ap->max_elements * sizeof(StygianSoAEffects), NULL,
+               GL_DYNAMIC_DRAW);
+  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, ap->soa_ssbo_effects);
+
+  // Allocate GPU-side version tracking for SoA chunk upload
+  // Default chunk_size 256 → chunk_count = ceil(max_elements / 256)
+  {
+    uint32_t cs = 256u;
+    uint32_t cc = (ap->max_elements + cs - 1u) / cs;
+    ap->soa_chunk_count = cc;
+    ap->gpu_hot_versions =
+        (uint32_t *)ap_alloc(ap, cc * sizeof(uint32_t), _Alignof(uint32_t));
+    ap->gpu_appearance_versions =
+        (uint32_t *)ap_alloc(ap, cc * sizeof(uint32_t), _Alignof(uint32_t));
+    ap->gpu_effects_versions =
+        (uint32_t *)ap_alloc(ap, cc * sizeof(uint32_t), _Alignof(uint32_t));
+    if (ap->gpu_hot_versions)
+      memset(ap->gpu_hot_versions, 0, cc * sizeof(uint32_t));
+    if (ap->gpu_appearance_versions)
+      memset(ap->gpu_appearance_versions, 0, cc * sizeof(uint32_t));
+    if (ap->gpu_effects_versions)
+      memset(ap->gpu_effects_versions, 0, cc * sizeof(uint32_t));
+  }
+
+  ap->submit_hot = (StygianSoAHot *)ap_alloc(
+      ap, (size_t)ap->max_elements * sizeof(StygianSoAHot),
+      _Alignof(StygianSoAHot));
+  if (!ap->submit_hot) {
+    printf("[Stygian AP] Failed to allocate submit hot buffer\n");
     stygian_ap_destroy(ap);
     return NULL;
   }
@@ -673,27 +773,53 @@ void stygian_ap_destroy(StygianAP *ap) {
   if (!ap)
     return;
 
-  if (ap->ssbo)
-    glDeleteBuffers(1, &ap->ssbo);
+  if (ap->clip_ssbo)
+    glDeleteBuffers(1, &ap->clip_ssbo);
+  if (ap->soa_ssbo_hot)
+    glDeleteBuffers(1, &ap->soa_ssbo_hot);
+  if (ap->soa_ssbo_appearance)
+    glDeleteBuffers(1, &ap->soa_ssbo_appearance);
+  if (ap->soa_ssbo_effects)
+    glDeleteBuffers(1, &ap->soa_ssbo_effects);
   if (ap->vbo)
     glDeleteBuffers(1, &ap->vbo);
   if (ap->program)
     glDeleteProgram(ap->program);
-  free(ap->submit_buffer);
-  ap->submit_buffer = NULL;
+  ap_free(ap, ap->gpu_hot_versions);
+  ap_free(ap, ap->gpu_appearance_versions);
+  ap_free(ap, ap->gpu_effects_versions);
+  ap_free(ap, ap->submit_hot);
+  ap->gpu_hot_versions = NULL;
+  ap->gpu_appearance_versions = NULL;
+  ap->gpu_effects_versions = NULL;
+  ap->submit_hot = NULL;
 
   if (ap->gl_context) {
     stygian_window_gl_destroy_context(ap->gl_context);
     ap->gl_context = NULL;
   }
 
-  free(ap);
+  // Free AP struct via its own allocator
+  StygianAllocator *allocator = ap->allocator;
+  cfg_free(allocator, ap);
 }
 
 StygianAPAdapterClass stygian_ap_get_adapter_class(const StygianAP *ap) {
   if (!ap)
     return STYGIAN_AP_ADAPTER_UNKNOWN;
   return ap->adapter_class;
+}
+
+uint32_t stygian_ap_get_last_upload_bytes(const StygianAP *ap) {
+  if (!ap)
+    return 0u;
+  return ap->last_upload_bytes;
+}
+
+uint32_t stygian_ap_get_last_upload_ranges(const StygianAP *ap) {
+  if (!ap)
+    return 0u;
+  return ap->last_upload_ranges;
 }
 
 // ============================================================================
@@ -710,11 +836,11 @@ bool stygian_ap_reload_shaders(StygianAP *ap) {
       new_loc_output_matrix, new_loc_output_src_srgb, new_loc_output_src_gamma,
       new_loc_output_dst_srgb, new_loc_output_dst_gamma;
   GLuint new_program = compile_program_internal(
-      ap->shader_dir, &new_loc_screen_size, &new_loc_font_tex,
-      &new_loc_image_tex, &new_loc_atlas_size, &new_loc_px_range,
-      &new_loc_output_transform_enabled, &new_loc_output_matrix,
-      &new_loc_output_src_srgb, &new_loc_output_src_gamma,
-      &new_loc_output_dst_srgb, &new_loc_output_dst_gamma);
+      ap, &new_loc_screen_size, &new_loc_font_tex, &new_loc_image_tex,
+      &new_loc_atlas_size, &new_loc_px_range, &new_loc_output_transform_enabled,
+      &new_loc_output_matrix, &new_loc_output_src_srgb,
+      &new_loc_output_src_gamma, &new_loc_output_dst_srgb,
+      &new_loc_output_dst_gamma);
 
   if (!new_program) {
     // Compilation failed - keep old shader, no black screen!
@@ -789,13 +915,12 @@ void stygian_ap_begin_frame(StygianAP *ap, int width, int height) {
   upload_output_color_transform_uniforms(ap);
 
   glBindVertexArray(ap->vao);
-  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ap->ssbo);
+  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, ap->clip_ssbo);
 }
 
-void stygian_ap_submit(StygianAP *ap, const StygianGPUElement *elements,
-                       uint32_t count, const uint32_t *dirty_ids,
-                       uint32_t dirty_count) {
-  if (!ap || !elements || count == 0)
+void stygian_ap_submit(StygianAP *ap, const StygianSoAHot *soa_hot,
+                       uint32_t count) {
+  if (!ap || !soa_hot || !ap->submit_hot || count == 0)
     return;
 
   if (count > ap->max_elements) {
@@ -812,12 +937,18 @@ void stygian_ap_submit(StygianAP *ap, const StygianGPUElement *elements,
   uint32_t mapped_count = 0;
 
   for (uint32_t i = 0; i < count; ++i) {
-    StygianGPUElement e = elements[i];
+    ap->submit_hot[i] = soa_hot[i];
 
-    if (e.type == STYGIAN_TEXTURE && e.texture_id != 0) {
+    // Read type and texture_id directly from SoA hot
+    // Note: type is packed with render_mode in upper 16 bits, but for checking
+    // STYGIAN_TEXTURE we only care about the lower 16 bits (element type).
+    uint32_t type = ap->submit_hot[i].type & 0xFFFF;
+    uint32_t tex_id = ap->submit_hot[i].texture_id;
+
+    if (type == STYGIAN_TEXTURE && tex_id != 0) {
       uint32_t slot = UINT32_MAX;
       for (uint32_t j = 0; j < mapped_count; ++j) {
-        if (mapped_handles[j] == e.texture_id) {
+        if (mapped_handles[j] == tex_id) {
           slot = j;
           break;
         }
@@ -826,18 +957,14 @@ void stygian_ap_submit(StygianAP *ap, const StygianGPUElement *elements,
       if (slot == UINT32_MAX) {
         if (mapped_count < STYGIAN_GL_IMAGE_SAMPLERS) {
           slot = mapped_count;
-          mapped_handles[mapped_count++] = e.texture_id;
+          mapped_handles[mapped_count++] = tex_id;
         } else {
-          // Out of sampler slots this frame: mark invalid so shader renders magenta.
           slot = STYGIAN_GL_IMAGE_SAMPLERS;
         }
       }
-      e.texture_id = slot;
-    } else {
-      e.texture_id = 0;
+      // Keep CPU source immutable; write remapped slot to submit stream only.
+      ap->submit_hot[i].texture_id = slot;
     }
-
-    ap->submit_buffer[i] = e;
   }
 
   // Bind image textures to configured image units.
@@ -845,24 +972,152 @@ void stygian_ap_submit(StygianAP *ap, const StygianGPUElement *elements,
     glActiveTexture(GL_TEXTURE0 + STYGIAN_GL_IMAGE_UNIT_BASE + i);
     glBindTexture(GL_TEXTURE_2D, (GLuint)mapped_handles[i]);
   }
+}
 
-  // Dirty uploads do not work with texture remapping, upload remapped buffer.
-  (void)dirty_ids;
-  (void)dirty_count;
-  glBindBuffer(GL_SHADER_STORAGE_BUFFER, ap->ssbo);
-  glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
-                  count * sizeof(StygianGPUElement), ap->submit_buffer);
+// ============================================================================
+// SoA Versioned Chunk Upload
+// ============================================================================
+
+void stygian_ap_submit_soa(StygianAP *ap, const StygianSoAHot *hot,
+                           const StygianSoAAppearance *appearance,
+                           const StygianSoAEffects *effects,
+                           uint32_t element_count,
+                           const StygianBufferChunk *chunks,
+                           uint32_t chunk_count, uint32_t chunk_size) {
+  if (!ap || !hot || !appearance || !effects || !chunks || element_count == 0)
+    return;
+  const StygianSoAHot *hot_src = ap->submit_hot ? ap->submit_hot : hot;
+
+  ap->last_upload_bytes = 0u;
+  ap->last_upload_ranges = 0u;
+
+  // Ensure GPU version arrays are large enough
+  if (chunk_count > ap->soa_chunk_count) {
+    // Should not happen if config is consistent, but guard anyway
+    chunk_count = ap->soa_chunk_count;
+  }
+
+  for (uint32_t ci = 0; ci < chunk_count; ci++) {
+    const StygianBufferChunk *c = &chunks[ci];
+    uint32_t base = ci * chunk_size;
+
+    // --- Hot buffer ---
+    if (ap->gpu_hot_versions && c->hot_version != ap->gpu_hot_versions[ci]) {
+      // Determine upload range
+      uint32_t dmin = c->hot_dirty_min;
+      uint32_t dmax = c->hot_dirty_max;
+      if (dmin <= dmax) {
+        uint32_t abs_min = base + dmin;
+        uint32_t abs_max = base + dmax;
+        if (abs_max >= element_count)
+          abs_max = element_count - 1;
+        if (abs_min < element_count) {
+          uint32_t range_count = abs_max - abs_min + 1;
+          glBindBuffer(GL_SHADER_STORAGE_BUFFER, ap->soa_ssbo_hot);
+          glBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                          (intptr_t)abs_min * (intptr_t)sizeof(StygianSoAHot),
+                          (intptr_t)range_count *
+                              (intptr_t)sizeof(StygianSoAHot),
+                          &hot_src[abs_min]);
+          ap->last_upload_bytes += range_count * (uint32_t)sizeof(StygianSoAHot);
+          ap->last_upload_ranges++;
+        }
+      }
+      ap->gpu_hot_versions[ci] = c->hot_version;
+    }
+
+    // --- Appearance buffer ---
+    if (ap->gpu_appearance_versions &&
+        c->appearance_version != ap->gpu_appearance_versions[ci]) {
+      uint32_t dmin = c->appearance_dirty_min;
+      uint32_t dmax = c->appearance_dirty_max;
+      if (dmin <= dmax) {
+        uint32_t abs_min = base + dmin;
+        uint32_t abs_max = base + dmax;
+        if (abs_max >= element_count)
+          abs_max = element_count - 1;
+        if (abs_min < element_count) {
+          uint32_t range_count = abs_max - abs_min + 1;
+          glBindBuffer(GL_SHADER_STORAGE_BUFFER, ap->soa_ssbo_appearance);
+          glBufferSubData(
+              GL_SHADER_STORAGE_BUFFER,
+              (intptr_t)abs_min * (intptr_t)sizeof(StygianSoAAppearance),
+              (intptr_t)range_count * (intptr_t)sizeof(StygianSoAAppearance),
+              &appearance[abs_min]);
+          ap->last_upload_bytes +=
+              range_count * (uint32_t)sizeof(StygianSoAAppearance);
+          ap->last_upload_ranges++;
+        }
+      }
+      ap->gpu_appearance_versions[ci] = c->appearance_version;
+    }
+
+    // --- Effects buffer ---
+    if (ap->gpu_effects_versions &&
+        c->effects_version != ap->gpu_effects_versions[ci]) {
+      uint32_t dmin = c->effects_dirty_min;
+      uint32_t dmax = c->effects_dirty_max;
+      if (dmin <= dmax) {
+        uint32_t abs_min = base + dmin;
+        uint32_t abs_max = base + dmax;
+        if (abs_max >= element_count)
+          abs_max = element_count - 1;
+        if (abs_min < element_count) {
+          uint32_t range_count = abs_max - abs_min + 1;
+          glBindBuffer(GL_SHADER_STORAGE_BUFFER, ap->soa_ssbo_effects);
+          glBufferSubData(
+              GL_SHADER_STORAGE_BUFFER,
+              (intptr_t)abs_min * (intptr_t)sizeof(StygianSoAEffects),
+              (intptr_t)range_count * (intptr_t)sizeof(StygianSoAEffects),
+              &effects[abs_min]);
+          ap->last_upload_bytes +=
+              range_count * (uint32_t)sizeof(StygianSoAEffects);
+          ap->last_upload_ranges++;
+        }
+      }
+      ap->gpu_effects_versions[ci] = c->effects_version;
+    }
+  }
 }
 
 void stygian_ap_draw(StygianAP *ap) {
   if (!ap || ap->element_count == 0)
     return;
-  glDrawArraysInstanced(GL_TRIANGLES, 0, 6, ap->element_count);
+  stygian_ap_draw_range(ap, 0u, ap->element_count);
+}
+
+void stygian_ap_draw_range(StygianAP *ap, uint32_t first_instance,
+                           uint32_t instance_count) {
+  if (!ap || instance_count == 0)
+    return;
+  if (glDrawArraysInstancedBaseInstance) {
+    glDrawArraysInstancedBaseInstance(GL_TRIANGLES, 0, 6, instance_count,
+                                      first_instance);
+    return;
+  }
+  if (first_instance != 0u) {
+    // This should be unavailable only on very old GL drivers.
+    // Fall back to full draw to preserve visibility over perfect layering.
+    glDrawArraysInstanced(GL_TRIANGLES, 0, 6, ap->element_count);
+    return;
+  }
+  glDrawArraysInstanced(GL_TRIANGLES, 0, 6, instance_count);
 }
 
 void stygian_ap_end_frame(StygianAP *ap) {
   if (!ap)
     return;
+}
+
+void stygian_ap_set_clips(StygianAP *ap, const float *clips, uint32_t count) {
+  if (!ap || !ap->clip_ssbo || !clips || count == 0)
+    return;
+  if (count > STYGIAN_MAX_CLIPS)
+    count = STYGIAN_MAX_CLIPS;
+
+  glBindBuffer(GL_SHADER_STORAGE_BUFFER, ap->clip_ssbo);
+  glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, count * sizeof(float) * 4,
+                  clips);
 }
 
 void stygian_ap_swap(StygianAP *ap) {
@@ -895,8 +1150,8 @@ StygianAPTexture stygian_ap_texture_create(StygianAP *ap, int w, int h,
   return (StygianAPTexture)tex;
 }
 
-bool stygian_ap_texture_update(StygianAP *ap, StygianAPTexture tex, int x, int y,
-                               int w, int h, const void *rgba) {
+bool stygian_ap_texture_update(StygianAP *ap, StygianAPTexture tex, int x,
+                               int y, int w, int h, const void *rgba) {
   if (!ap || !tex || !rgba || w <= 0 || h <= 0)
     return false;
 
@@ -939,16 +1194,11 @@ void stygian_ap_set_font_texture(StygianAP *ap, StygianAPTexture tex,
   glUniform1f(ap->loc_px_range, px_range);
 }
 
-void stygian_ap_set_output_color_transform(StygianAP *ap, bool enabled,
-                                           const float *rgb3x3,
-                                           bool src_srgb_transfer,
-                                           float src_gamma,
-                                           bool dst_srgb_transfer,
-                                           float dst_gamma) {
+void stygian_ap_set_output_color_transform(
+    StygianAP *ap, bool enabled, const float *rgb3x3, bool src_srgb_transfer,
+    float src_gamma, bool dst_srgb_transfer, float dst_gamma) {
   static const float identity[9] = {
-      1.0f, 0.0f, 0.0f,
-      0.0f, 1.0f, 0.0f,
-      0.0f, 0.0f, 1.0f,
+      1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
   };
   if (!ap)
     return;
@@ -980,16 +1230,17 @@ StygianAPSurface *stygian_ap_surface_create(StygianAP *ap,
   if (!ap || !window)
     return NULL;
 
-  StygianAPSurface *surf =
-      (StygianAPSurface *)calloc(1, sizeof(StygianAPSurface));
+  StygianAPSurface *surf = (StygianAPSurface *)ap_alloc(
+      ap, sizeof(StygianAPSurface), _Alignof(StygianAPSurface));
   if (!surf)
     return NULL;
+  memset(surf, 0, sizeof(StygianAPSurface));
 
   surf->window = window;
 
   if (!stygian_window_gl_set_pixel_format(window)) {
     printf("[Stygian AP GL] Failed to set pixel format for surface\n");
-    free(surf);
+    ap_free(ap, surf);
     return NULL;
   }
 
@@ -1006,7 +1257,7 @@ void stygian_ap_surface_destroy(StygianAP *ap, StygianAPSurface *surface) {
   // stygian_window_native_context might return a persistent DC or temp.
   // Assuming persistent for now or handled by window class.
 
-  free(surface);
+  ap_free(ap, surface);
 }
 
 void stygian_ap_surface_begin(StygianAP *ap, StygianAPSurface *surface,
@@ -1054,15 +1305,17 @@ void stygian_ap_surface_begin(StygianAP *ap, StygianAPSurface *surface,
   upload_output_color_transform_uniforms(ap);
 
   glBindVertexArray(ap->vao);
-  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ap->ssbo);
+  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ap->soa_ssbo_hot);
+  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ap->soa_ssbo_appearance);
+  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ap->soa_ssbo_effects);
+  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, ap->clip_ssbo);
 }
 
 void stygian_ap_surface_submit(StygianAP *ap, StygianAPSurface *surface,
-                               const StygianGPUElement *elements,
-                               uint32_t count) {
+                               const StygianSoAHot *soa_hot, uint32_t count) {
   // Reuse main submit logic but targeting current context
   // We just need to upload to SSBO (shared context!)
-  stygian_ap_submit(ap, elements, count, NULL, 0);
+  stygian_ap_submit(ap, soa_hot, count);
   stygian_ap_draw(ap);
   stygian_ap_end_frame(ap);
 }

@@ -1,0 +1,10 @@
+backends/stygian_ap_gl.c:16:9: warning: unknown pragma ignored [-Wunknown-pragmas]
+   16 | #pragma comment(lib, "opengl32.lib")
+      |         ^
+backends/stygian_ap_gl.c:17:9: warning: unknown pragma ignored [-Wunknown-pragmas]
+   17 | #pragma comment(lib, "gdi32.lib")
+      |         ^
+backends/stygian_ap_gl.c:18:9: warning: unknown pragma ignored [-Wunknown-pragmas]
+   18 | #pragma comment(lib, "dwmapi.lib")
+      |         ^
+3 warnings generated.

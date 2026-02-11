@@ -1,0 +1,55 @@
+/* ============================================================================
+ * STYGIAN TYPE REFERENCE - Quick Guide to Element Types
+ * ============================================================================
+ * 
+ * Change the `type` parameter in draw() to switch between different elements:
+ * 
+ * TYPE 0: Rounded Box (basic container)
+ *   - Use for: Buttons, panels, generic containers
+ *   - Parameters: radius controls corner rounding
+ *   - Example: draw(x, y, w, h, 0, r, g, b, a, 0,0,0,0, 8.0f, 0, 0, 0, 0);
+ * 
+ * TYPE 2: Minimize Icon (horizontal line)
+ *   - Use for: Minimize button icon
+ *   - Auto-sized based on resolution
+ * 
+ * TYPE 3: Maximize Icon (square outline)
+ *   - Use for: Maximize button icon
+ *   - Auto-sized based on resolution
+ * 
+ * TYPE 4: Close Icon (X)
+ *   - Use for: Close button icon
+ *   - Auto-sized based on resolution
+ * 
+ * TYPE 5: Window Body (gradient border)
+ *   - Use for: Main window background
+ *   - Special: Applies gradient from uBorderColor (top) to black (bottom)
+ *   - Example: draw(0, 0, width, height, 5, 0.5,0.5,0.5,1, 0.235,0.259,0.294,1, 10, 0, 0, 0, 0);
+ * 
+ * TYPE 7: Editor Panel (flat rounded rect)
+ *   - Use for: Content panels, editor areas
+ *   - No border gradient, just solid color
+ * 
+ * TYPE 9: Metaball Menu Bar (organic blend)
+ *   - Use for: Menu bars that blend organically with window top
+ *   - Parameters:
+ *     - blend: Smoothness of metaball blend (try 8.0-15.0)
+ *     - quad_h: Protrusion depth downward from top (e.g., 30.0)
+ *   - Example: draw(x, 0, w, 40, 9, r,g,b,a, 0,0,0,0, 6, 0, 12.0f, w, 30.0f);
+ *                                                              ^^^^  ^^  ^^^^
+ *                                                              blend  w  depth
+ * 
+ * CHANGING TYPES EXAMPLE:
+ * 
+ *   // Start with a simple rounded box:
+ *   draw(100, 100, 200, 40, 0, 0.2,0.2,0.2,1, 0,0,0,0, 8, 0, 0, 0, 0);
+ *                           ^
+ *                           type 0 = rounded box
+ * 
+ *   // Change to metaball menu bar:
+ *   draw(100, 0, 200, 40, 9, 0.2,0.2,0.2,1, 0,0,0,0, 6, 0, 12.0f, 200, 30);
+ *                         ^                                 ^^^^^  ^^^  ^^
+ *                         type 9 = metaball                 blend  w    h
+ * 
+ * ============================================================================
+ */
