@@ -241,6 +241,7 @@ int main(int argc, char **argv) {
   int height = 820;
   bool first_frame = true;
   bool show_perf = true;
+  bool perf_scope_visible_prev = false;
   double start_time;
   double last_tick_time;
   double next_interval_time;
@@ -509,6 +510,7 @@ int main(int argc, char **argv) {
       stygian_scope_begin(ctx, k_scope_perf);
       stygian_mini_perf_draw(ctx, font, &perf, width, height);
       stygian_scope_end(ctx);
+      perf_scope_visible_prev = true;
     }
 
     if (first_frame || event_mutated) {
@@ -525,8 +527,11 @@ int main(int argc, char **argv) {
     if (overlay_changed) {
       stygian_scope_invalidate_next(ctx, k_scope_overlay);
     }
-    if (!show_perf) {
+    if (!show_perf && perf_scope_visible_prev) {
+      // Clear cached perf scope once when hiding; repeated invalidation keeps
+      // idle scenarios rendering even with --no-perf.
       stygian_scope_invalidate_next(ctx, k_scope_perf);
+      perf_scope_visible_prev = false;
     }
 
     stygian_widgets_commit_regions();
