@@ -106,7 +106,8 @@ static float g_msg_scroll_y = 0.0f;
 static bool g_show_debug_widget = false;
 static bool g_perf_widget_pos_init = false;
 static const StygianScopeId k_scope_chat_base = 0x3001ull;
-static const StygianScopeId k_scope_chat_perf = 0x3002ull;
+static const StygianScopeId k_scope_chat_perf =
+    STYGIAN_OVERLAY_SCOPE_BASE | (StygianScopeId)0x3002ull;
 static StygianPerfWidget g_perf_widget = {
     .x = 0.0f,
     .y = 0.0f,
@@ -116,10 +117,10 @@ static StygianPerfWidget g_perf_widget = {
     .enabled = true,
     .show_graph = true,
     .show_input = true,
-    .auto_scale_graph = true,
+    .auto_scale_graph = false,
     .history_window = 120u,
     .idle_hz = 30u,
-    .active_hz = 60u,
+    .active_hz = 30u,
     .text_hz = 5u,
     .max_stress_hz = 120u,
     .stress_mode = false,
@@ -751,6 +752,7 @@ int main(void) {
     int decode_budget = 4;
     bool event_mutated = false;
     bool event_requested = false;
+    bool event_eval = false;
     bool ui_state_changed = false;
     bool pending_decode = false;
     static bool first_frame = true;
@@ -768,6 +770,8 @@ int main(void) {
         event_mutated = true;
       if (impact & STYGIAN_IMPACT_REQUEST_REPAINT)
         event_requested = true;
+      if (impact & STYGIAN_IMPACT_REQUEST_EVAL)
+        event_eval = true;
       if (ev.type == STYGIAN_EVENT_KEY_DOWN &&
           ev.key.key == STYGIAN_KEY_ENTER) {
         enter_pressed = true;
@@ -779,7 +783,8 @@ int main(void) {
       stygian_set_repaint_source(ctx, "decode");
       stygian_request_repaint_hz(ctx, 60u);
     }
-    if (!event_mutated && !event_requested && !pending_decode && !first_frame) {
+    if (!event_mutated && !event_requested && !event_eval && !pending_decode &&
+        !first_frame) {
       if (stygian_window_wait_event_timeout(win, &ev, wait_ms)) {
         StygianWidgetEventImpact impact =
             stygian_widgets_process_event_ex(ctx, &ev);
@@ -787,6 +792,8 @@ int main(void) {
           event_mutated = true;
         if (impact & STYGIAN_IMPACT_REQUEST_REPAINT)
           event_requested = true;
+        if (impact & STYGIAN_IMPACT_REQUEST_EVAL)
+          event_eval = true;
         if (ev.type == STYGIAN_EVENT_KEY_DOWN &&
             ev.key.key == STYGIAN_KEY_ENTER) {
           enter_pressed = true;
@@ -798,6 +805,8 @@ int main(void) {
             event_mutated = true;
           if (queued_impact & STYGIAN_IMPACT_REQUEST_REPAINT)
             event_requested = true;
+          if (queued_impact & STYGIAN_IMPACT_REQUEST_EVAL)
+            event_eval = true;
           if (ev.type == STYGIAN_EVENT_KEY_DOWN &&
               ev.key.key == STYGIAN_KEY_ENTER) {
             enter_pressed = true;
@@ -807,52 +816,56 @@ int main(void) {
     }
 
     repaint_pending = stygian_has_pending_repaint(ctx);
-    if (!event_mutated && !event_requested && !pending_decode && !first_frame &&
-        !repaint_pending) {
-      continue;
-    }
-    first_frame = false;
-
-    stygian_mouse_pos(win, &mx, &my);
     {
-      uint64_t now = now_us();
-      if ((now - last_perf_log_us) >= 10000000ull) {
-        printf("[chat_emoji_demo] perf loop lookup(avg/p95)=%.3f/%.3fms "
-               "decode(avg/p95)=%.3f/%.3fms upload(avg/p95)=%.3f/%.3fms "
-               "frame(draw=%u upload=%uB/%ur cpu=%.2f/%.2f/%.2f repaint=%s)\n",
-               perf_avg_ms(&g_lookup_perf), perf_p95_ms(&g_lookup_perf),
-               perf_avg_ms(&g_decode_perf), perf_p95_ms(&g_decode_perf),
-               perf_avg_ms(&g_upload_perf), perf_p95_ms(&g_upload_perf),
-               stygian_get_last_frame_draw_calls(ctx),
-               stygian_get_last_frame_upload_bytes(ctx),
-               stygian_get_last_frame_upload_ranges(ctx),
-               stygian_get_last_frame_build_ms(ctx),
-               stygian_get_last_frame_submit_ms(ctx),
-               stygian_get_last_frame_present_ms(ctx),
-               stygian_get_repaint_source(ctx));
-        last_perf_log_us = now;
+      bool render_frame =
+          first_frame || event_mutated || pending_decode || repaint_pending;
+      bool eval_only_frame = (!render_frame && (event_eval || event_requested));
+      if (!render_frame && !eval_only_frame) {
+        continue;
       }
-    }
+      first_frame = false;
 
-    stygian_window_get_size(win, &w, &h);
-    if (event_mutated || pending_decode) {
-      stygian_scope_invalidate_now(ctx, k_scope_chat_base);
-      if (event_mutated)
-        stygian_set_repaint_source(ctx, "event-mutation");
-      else
+      stygian_mouse_pos(win, &mx, &my);
+      {
+        uint64_t now = now_us();
+        if ((now - last_perf_log_us) >= 10000000ull) {
+          printf("[chat_emoji_demo] perf loop lookup(avg/p95)=%.3f/%.3fms "
+                 "decode(avg/p95)=%.3f/%.3fms upload(avg/p95)=%.3f/%.3fms "
+                 "frame(draw=%u upload=%uB/%ur cpu=%.2f/%.2f/%.2f repaint=%s)\n",
+                 perf_avg_ms(&g_lookup_perf), perf_p95_ms(&g_lookup_perf),
+                 perf_avg_ms(&g_decode_perf), perf_p95_ms(&g_decode_perf),
+                 perf_avg_ms(&g_upload_perf), perf_p95_ms(&g_upload_perf),
+                 stygian_get_last_frame_draw_calls(ctx),
+                 stygian_get_last_frame_upload_bytes(ctx),
+                 stygian_get_last_frame_upload_ranges(ctx),
+                 stygian_get_last_frame_build_ms(ctx),
+                 stygian_get_last_frame_submit_ms(ctx),
+                 stygian_get_last_frame_present_ms(ctx),
+                 stygian_get_repaint_source(ctx));
+          last_perf_log_us = now;
+        }
+      }
+
+      stygian_window_get_size(win, &w, &h);
+      if (pending_decode) {
+        stygian_scope_invalidate_now(ctx, k_scope_chat_base);
         stygian_set_repaint_source(ctx, "decode");
-    }
-    if (g_show_debug_widget && repaint_pending) {
-      stygian_scope_invalidate_now(ctx, k_scope_chat_perf);
-    }
-    stygian_begin_frame(ctx, w, h);
-    stygian_scope_begin(ctx, k_scope_chat_base);
+      }
+      if (!eval_only_frame && g_show_debug_widget &&
+          (repaint_pending || pending_decode || event_requested)) {
+        stygian_scope_invalidate_now(ctx, k_scope_chat_perf);
+      }
+      stygian_begin_frame_intent(
+          ctx, w, h,
+          eval_only_frame ? STYGIAN_FRAME_EVAL_ONLY : STYGIAN_FRAME_RENDER);
+      stygian_scope_begin(ctx, k_scope_chat_base);
 
-    stygian_rect(ctx, 0, 0, (float)w, (float)h, 0.08f, 0.08f, 0.09f, 1.0f);
-    stygian_rect_rounded(ctx, 24, 24, (float)w - 48, (float)h - 120, 0.12f,
-                         0.12f, 0.13f, 1.0f, 8.0f);
-    stygian_rect_rounded(ctx, 24, (float)h - 84, (float)w - 48, 56, 0.14f,
-                         0.14f, 0.16f, 1.0f, 8.0f);
+      stygian_rect(ctx, 0, 0, (float)w, (float)h, 0.08f, 0.08f, 0.09f, 1.0f);
+      stygian_rect_rounded(ctx, 24, 24, (float)w - 48, (float)h - 120, 0.12f,
+                           0.12f, 0.13f, 1.0f, 8.0f);
+      stygian_rect_rounded(ctx, 24, (float)h - 84, (float)w - 48, 56, 0.14f,
+                           0.14f, 0.16f, 1.0f, 8.0f);
+    }
 
     {
       char perf_line[256];
@@ -1134,10 +1147,10 @@ int main(void) {
     prev_enter = enter_down;
 
     stygian_scope_end(ctx);
-    if (ui_state_changed && !event_mutated) {
+    if (ui_state_changed) {
       stygian_scope_invalidate_next(ctx, k_scope_chat_base);
       stygian_set_repaint_source(ctx, "mutation");
-      stygian_request_repaint_after_ms(ctx, 1u);
+      stygian_request_repaint_after_ms(ctx, 0u);
     }
 
     if (g_show_debug_widget) {

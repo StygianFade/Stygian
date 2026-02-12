@@ -155,6 +155,21 @@ typedef struct StygianConfig {
   StygianAllocator *persistent_allocator; // Optional: defaults to CRT allocator
 } StygianConfig;
 
+typedef struct StygianContextErrorRecord {
+  uint64_t timestamp_ms;
+  uint32_t frame_index;
+  uint32_t thread_id;
+  uint32_t code;
+  uint64_t scope_id;
+  uint32_t source_tag;
+  uint32_t message_hash;
+  char message[96];
+} StygianContextErrorRecord;
+
+typedef void (*StygianContextErrorCallback)(StygianContext *ctx, uint32_t code,
+                                            const char *message,
+                                            void *user_data);
+
 // StygianGPUElement struct removed (AoS elimination)
 // Data now stored in SoA structures (StygianSoAHot, StygianSoAAppearance, etc.)
 
@@ -228,6 +243,11 @@ typedef enum StygianRepaintReasonFlags {
   STYGIAN_REPAINT_REASON_FORCED = 1u << 4,
 } StygianRepaintReasonFlags;
 
+typedef enum StygianFrameIntent {
+  STYGIAN_FRAME_RENDER = 0,
+  STYGIAN_FRAME_EVAL_ONLY = 1,
+} StygianFrameIntent;
+
 void stygian_repaint_begin_frame(StygianContext *ctx);
 void stygian_repaint_end_frame(StygianContext *ctx);
 void stygian_request_repaint_hz(StygianContext *ctx, uint32_t hz);
@@ -240,7 +260,10 @@ const char *stygian_get_repaint_source(const StygianContext *ctx);
 uint32_t stygian_get_repaint_reason_flags(const StygianContext *ctx);
 
 void stygian_begin_frame(StygianContext *ctx, int width, int height);
+void stygian_begin_frame_intent(StygianContext *ctx, int width, int height,
+                                StygianFrameIntent intent);
 void stygian_end_frame(StygianContext *ctx); // Single draw call by default
+bool stygian_is_eval_only_frame(const StygianContext *ctx);
 
 // Frame stats
 uint32_t stygian_get_frame_draw_calls(const StygianContext *ctx);
@@ -256,12 +279,17 @@ stygian_get_last_frame_scope_forced_rebuilds(const StygianContext *ctx);
 float stygian_get_last_frame_build_ms(const StygianContext *ctx);
 float stygian_get_last_frame_submit_ms(const StygianContext *ctx);
 float stygian_get_last_frame_present_ms(const StygianContext *ctx);
+float stygian_get_last_frame_gpu_ms(const StygianContext *ctx);
+uint32_t stygian_get_last_frame_reason_flags(const StygianContext *ctx);
+uint32_t stygian_get_last_frame_eval_only(const StygianContext *ctx);
 uint32_t stygian_get_active_element_count(const StygianContext *ctx);
 uint32_t stygian_get_element_capacity(const StygianContext *ctx);
 uint32_t stygian_get_free_element_count(const StygianContext *ctx);
 uint32_t stygian_get_font_count(const StygianContext *ctx);
 uint32_t stygian_get_inline_emoji_cache_count(const StygianContext *ctx);
 uint16_t stygian_get_clip_capacity(const StygianContext *ctx);
+uint32_t stygian_get_last_commit_applied(const StygianContext *ctx);
+uint32_t stygian_get_total_command_drops(const StygianContext *ctx);
 
 // Optional render layering (multi-pass draws)
 // Use when a widget needs its own pass without breaking core UI batching.
@@ -275,6 +303,10 @@ void stygian_scope_invalidate(StygianContext *ctx, StygianScopeId id);
 void stygian_scope_invalidate_now(StygianContext *ctx, StygianScopeId id);
 void stygian_scope_invalidate_next(StygianContext *ctx, StygianScopeId id);
 bool stygian_scope_is_dirty(StygianContext *ctx, StygianScopeId id);
+bool stygian_scope_get_last_dirty_info(const StygianContext *ctx,
+                                       StygianScopeId id, uint32_t *out_reason,
+                                       uint32_t *out_source_tag,
+                                       uint32_t *out_frame_index);
 
 // DDI: Overlay scope convenience APIs (separate tick domain from base UI)
 void stygian_overlay_scope_begin(StygianContext *ctx, uint32_t overlay_id);
@@ -393,6 +425,16 @@ void stygian_end_metaball_group(StygianContext *ctx, StygianElement group);
 
 // Get the associated window
 StygianWindow *stygian_get_window(StygianContext *ctx);
+
+void stygian_context_set_error_callback(StygianContext *ctx,
+                                        StygianContextErrorCallback callback,
+                                        void *user_data);
+void stygian_set_default_context_error_callback(
+    StygianContextErrorCallback callback, void *user_data);
+uint32_t stygian_context_get_recent_errors(const StygianContext *ctx,
+                                           StygianContextErrorRecord *out,
+                                           uint32_t max_count);
+uint32_t stygian_context_get_error_drop_count(const StygianContext *ctx);
 
 #ifdef __cplusplus
 }

@@ -69,6 +69,7 @@ void stygian_ap_destroy(StygianAP *ap);
 StygianAPAdapterClass stygian_ap_get_adapter_class(const StygianAP *ap);
 uint32_t stygian_ap_get_last_upload_bytes(const StygianAP *ap);
 uint32_t stygian_ap_get_last_upload_ranges(const StygianAP *ap);
+float stygian_ap_get_last_gpu_ms(const StygianAP *ap);
 
 // ============================================================================
 // Multi-Surface (for floating windows, additional viewports)
@@ -126,6 +127,11 @@ void stygian_ap_submit_soa(StygianAP *ap, const StygianSoAHot *hot,
 void stygian_ap_draw(StygianAP *ap);
 void stygian_ap_draw_range(StygianAP *ap, uint32_t first_instance,
                            uint32_t instance_count);
+
+// Optional GPU timing (backend-dependent).
+// If unsupported, begin/end are no-ops and last_gpu_ms returns 0.
+void stygian_ap_gpu_timer_begin(StygianAP *ap);
+void stygian_ap_gpu_timer_end(StygianAP *ap);
 
 // End frame - finalize frame (no draw for GL; ends command buffer for VK)
 void stygian_ap_end_frame(StygianAP *ap);

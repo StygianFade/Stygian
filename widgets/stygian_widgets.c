@@ -304,13 +304,7 @@ void stygian_widgets_begin_frame(StygianContext *ctx) {
   // Reset hot widget each frame
   g_widget_state.hot_id = 0;
 
-  // Keep drag/active interactions smooth without tying redraw to mouse-move
-  // events.
-  if (g_widget_state.ctx && g_widget_state.mouse_down &&
-      g_widget_state.active_id != 0u) {
-    stygian_set_repaint_source(g_widget_state.ctx, "drag");
-    stygian_request_repaint_hz(g_widget_state.ctx, 60u);
-  }
+  // Drag interaction stays event-driven; avoid periodic repaint tails.
 }
 
 StygianWidgetEventImpact
@@ -329,12 +323,6 @@ stygian_widgets_process_event_ex(StygianContext *ctx, const StygianEvent *e) {
     g_widget_state.mouse_dy = (float)e->mouse_move.dy;
     g_widget_state.mouse_x = e->mouse_move.x;
     g_widget_state.mouse_y = e->mouse_move.y;
-    if (g_widget_state.ctx && g_widget_state.active_id != 0u) {
-      stygian_set_repaint_source(g_widget_state.ctx, "drag");
-      stygian_request_repaint_hz(g_widget_state.ctx, 60u);
-      stygian_request_repaint_after_ms(g_widget_state.ctx, 1u);
-      impact |= STYGIAN_IMPACT_REQUEST_REPAINT;
-    }
   } else if (e->type == STYGIAN_EVENT_MOUSE_DOWN) {
     impact |= STYGIAN_IMPACT_POINTER_ONLY;
     g_widget_state.mouse_x = e->mouse_button.x;
@@ -370,15 +358,11 @@ stygian_widgets_process_event_ex(StygianContext *ctx, const StygianEvent *e) {
       // Middle/other buttons do not own widget state, but can still wake a
       // frame for region-bound behaviors (e.g. graph pan).
     }
-    // Pointer down requests an evaluation frame only for known interactive
-    // regions. Mutation remains separately tracked.
+    // Pointer down requests only evaluation for known interactive regions.
+    // Mutation remains separately tracked and must be emitted by widget logic.
     should_repaint = hit_region || mutating_region;
     if (should_repaint) {
-      impact |= STYGIAN_IMPACT_REQUEST_REPAINT;
-    }
-    if (g_widget_state.ctx && should_repaint) {
-      stygian_set_repaint_source(g_widget_state.ctx, "event-pointer");
-      stygian_request_repaint_after_ms(g_widget_state.ctx, 1u);
+      impact |= STYGIAN_IMPACT_REQUEST_EVAL;
     }
   } else if (e->type == STYGIAN_EVENT_MOUSE_UP) {
     impact |= STYGIAN_IMPACT_POINTER_ONLY;
@@ -405,11 +389,7 @@ stygian_widgets_process_event_ex(StygianContext *ctx, const StygianEvent *e) {
       }
     }
     if (should_repaint) {
-      impact |= STYGIAN_IMPACT_REQUEST_REPAINT;
-    }
-    if (g_widget_state.ctx && should_repaint) {
-      stygian_set_repaint_source(g_widget_state.ctx, "event-pointer");
-      stygian_request_repaint_after_ms(g_widget_state.ctx, 1u);
+      impact |= STYGIAN_IMPACT_REQUEST_EVAL;
     }
   } else if (e->type == STYGIAN_EVENT_CHAR) {
     // Character input is meaningful only when a widget currently owns focus.
@@ -422,7 +402,7 @@ stygian_widgets_process_event_ex(StygianContext *ctx, const StygianEvent *e) {
       }
       if (g_widget_state.ctx) {
         stygian_set_repaint_source(g_widget_state.ctx, "event-char");
-        stygian_request_repaint_after_ms(g_widget_state.ctx, 1u);
+        stygian_request_repaint_after_ms(g_widget_state.ctx, 0u);
       }
     }
   } else if (e->type == STYGIAN_EVENT_KEY_DOWN ||
@@ -445,7 +425,7 @@ stygian_widgets_process_event_ex(StygianContext *ctx, const StygianEvent *e) {
       }
       if (g_widget_state.ctx) {
         stygian_set_repaint_source(g_widget_state.ctx, "event-key");
-        stygian_request_repaint_after_ms(g_widget_state.ctx, 1u);
+        stygian_request_repaint_after_ms(g_widget_state.ctx, 0u);
       }
     }
   } else if (e->type == STYGIAN_EVENT_SCROLL) {
@@ -459,30 +439,27 @@ stygian_widgets_process_event_ex(StygianContext *ctx, const StygianEvent *e) {
                                             (float)g_widget_state.mouse_y,
                                             STYGIAN_WIDGET_REGION_SCROLL);
     if (should_repaint)
-      impact |= STYGIAN_IMPACT_REQUEST_REPAINT;
-    if (g_widget_state.ctx && should_repaint) {
-      stygian_set_repaint_source(g_widget_state.ctx, "event-scroll");
-      stygian_request_repaint_after_ms(g_widget_state.ctx, 1u);
-    }
+      impact |= STYGIAN_IMPACT_REQUEST_EVAL;
   } else if (e->type == STYGIAN_EVENT_RESIZE) {
     impact |= STYGIAN_IMPACT_REQUEST_REPAINT;
     impact |= STYGIAN_IMPACT_LAYOUT_CHANGED;
     if (g_widget_state.ctx) {
       stygian_set_repaint_source(g_widget_state.ctx, "event-resize");
-      stygian_request_repaint_after_ms(g_widget_state.ctx, 1u);
+      stygian_request_repaint_after_ms(g_widget_state.ctx, 0u);
     }
   } else if (e->type == STYGIAN_EVENT_TICK) {
     impact |= STYGIAN_IMPACT_REQUEST_REPAINT;
     if (g_widget_state.ctx) {
       stygian_set_repaint_source(g_widget_state.ctx, "event-tick");
-      stygian_request_repaint_after_ms(g_widget_state.ctx, 1u);
+      stygian_request_repaint_after_ms(g_widget_state.ctx, 0u);
     }
   }
   if (impact & STYGIAN_IMPACT_POINTER_ONLY)
     g_widget_state.impact_pointer_only_events++;
   if (impact & STYGIAN_IMPACT_MUTATED_STATE)
     g_widget_state.impact_mutated_events++;
-  if (impact & STYGIAN_IMPACT_REQUEST_REPAINT)
+  if ((impact & STYGIAN_IMPACT_REQUEST_REPAINT) ||
+      (impact & STYGIAN_IMPACT_REQUEST_EVAL))
     g_widget_state.impact_request_events++;
   return impact;
 }
@@ -603,6 +580,7 @@ void stygian_perf_widget(StygianContext *ctx, StygianFont font,
   float build_ms;
   float submit_ms;
   float present_ms;
+  float gpu_ms;
   bool triad_mounted;
   bool triad_info_ok;
   StygianTriadPackInfo triad_info;
@@ -621,7 +599,7 @@ void stygian_perf_widget(StygianContext *ctx, StygianFont font,
   uint32_t frame_budget_hz;
   float budget_ms;
   float sample_ms;
-  float wall_ms;
+  float wall_ms = 0.0f;
   double sample_dt_s;
   double elapsed_s;
   uint32_t sample_steps;
@@ -745,6 +723,7 @@ void stygian_perf_widget(StygianContext *ctx, StygianFont font,
   build_ms = stygian_get_last_frame_build_ms(ctx);
   submit_ms = stygian_get_last_frame_submit_ms(ctx);
   present_ms = stygian_get_last_frame_present_ms(ctx);
+  gpu_ms = stygian_get_last_frame_gpu_ms(ctx);
 
   if (state->history_count > 0u) {
     uint32_t last_idx = (state->history_head + STYGIAN_PERF_HISTORY_MAX - 1u) %
@@ -756,10 +735,27 @@ void stygian_perf_widget(StygianContext *ctx, StygianFont font,
   if (sample_hz == 0u)
     sample_hz = 30u;
   sample_dt_s = 1.0 / (double)sample_hz;
-  sample_ms = build_ms + submit_ms + present_ms;
+  sample_ms = (gpu_ms > 0.0f && gpu_ms < 1000.0f) ? gpu_ms
+                                                  : (build_ms + submit_ms +
+                                                     present_ms);
   if (sample_ms <= 0.0f || sample_ms >= 1000.0f) {
     sample_ms = latest_ms > 0.0f ? latest_ms : 16.7f;
   }
+  // Quantize tiny timing noise before filtering to keep the polyline stable.
+  sample_ms = floorf(sample_ms * 20.0f + 0.5f) * 0.05f;
+  if (state->graph_filtered_ms <= 0.0f) {
+    state->graph_filtered_ms = sample_ms;
+  } else {
+    float alpha = interacting ? 0.18f : 0.10f;
+    float max_delta = interacting ? 8.0f : 2.5f;
+    float delta = sample_ms - state->graph_filtered_ms;
+    if (delta > max_delta)
+      delta = max_delta;
+    else if (delta < -max_delta)
+      delta = -max_delta;
+    state->graph_filtered_ms += delta * alpha;
+  }
+  sample_ms = state->graph_filtered_ms;
   now_s = perf_now_seconds();
   wall_ms = 0.0f;
   wall_fps = 0.0f;
@@ -875,8 +871,7 @@ void stygian_perf_widget(StygianContext *ctx, StygianFont font,
 
   line_y = y + header_h + 6.0f;
   snprintf(line, sizeof(line),
-           "Frame: %.2f ms | CPU FPS: %.1f | Wall FPS: %.1f", latest_ms,
-           state->fps_smoothed, state->fps_wall_smoothed);
+           "Frame: %.2f ms | FPS: %.1f", latest_ms, state->fps_wall_smoothed);
   stygian_text(ctx, font, line, x + 8.0f, line_y, line_size, 0.85f, 0.9f, 0.95f,
                1.0f);
   line_y += line_h;
@@ -902,8 +897,9 @@ void stygian_perf_widget(StygianContext *ctx, StygianFont font,
                1.0f);
   line_y += line_h;
 
-  snprintf(line, sizeof(line), "CPU ms: build=%.2f submit=%.2f present=%.2f",
-           build_ms, submit_ms, present_ms);
+  snprintf(line, sizeof(line),
+           "CPU ms: build=%.2f submit=%.2f present=%.2f | GPU ms: %.2f",
+           build_ms, submit_ms, present_ms, gpu_ms);
   stygian_text(ctx, font, line, x + 8.0f, line_y, line_size, 0.8f, 0.86f, 0.92f,
                1.0f);
   line_y += line_h;
@@ -990,16 +986,33 @@ void stygian_perf_widget(StygianContext *ctx, StygianFont font,
         draw_points = max_segments + 1u;
 
       if (state->auto_scale_graph) {
+        float raw_max_ms = 16.7f;
         for (i = 0; i < sample_count; i++) {
           uint32_t idx = (state->history_head + STYGIAN_PERF_HISTORY_MAX -
                           sample_count + i) %
                          STYGIAN_PERF_HISTORY_MAX;
-          if (state->history_ms[idx] > max_ms) {
-            max_ms = state->history_ms[idx];
+          if (state->history_ms[idx] > raw_max_ms) {
+            raw_max_ms = state->history_ms[idx];
           }
         }
+        if (raw_max_ms < 8.0f)
+          raw_max_ms = 8.0f;
+        if (state->graph_scale_ms <= 0.0f) {
+          state->graph_scale_ms = raw_max_ms;
+        } else if (raw_max_ms > state->graph_scale_ms) {
+          // Rise faster to preserve spikes.
+          state->graph_scale_ms +=
+              (raw_max_ms - state->graph_scale_ms) * 0.25f;
+        } else {
+          // Decay slower to reduce jitter.
+          state->graph_scale_ms +=
+              (raw_max_ms - state->graph_scale_ms) * 0.08f;
+        }
+        max_ms = state->graph_scale_ms;
         if (max_ms < 8.0f)
           max_ms = 8.0f;
+        // Quantize to reduce tiny autoscale oscillations.
+        max_ms = floorf((max_ms + 1.0f) / 2.0f) * 2.0f;
       }
 
       stygian_rect(ctx, graph_x, line_y, graph_w, graph_h, 0.05f, 0.06f, 0.08f,
@@ -1012,6 +1025,7 @@ void stygian_perf_widget(StygianContext *ctx, StygianFont font,
         if (tt > 1.0f)
           tt = 1.0f;
         ty = line_y + graph_h - (tt * graph_h);
+        ty = floorf(ty) + 0.5f;
         stygian_line(ctx, graph_x, ty, graph_x + graph_w, ty, 1.0f, 0.65f,
                      0.72f, 0.9f, 0.55f);
       }
@@ -1019,6 +1033,7 @@ void stygian_perf_widget(StygianContext *ctx, StygianFont font,
         uint32_t src_i;
         uint32_t idx;
         float ms;
+        float src_f;
         float t;
         float px;
         float py;
@@ -1027,8 +1042,11 @@ void stygian_perf_widget(StygianContext *ctx, StygianFont font,
         if (draw_points <= 1u) {
           src_i = sample_count - 1u;
         } else {
-          src_i = (uint32_t)(((uint64_t)i * (uint64_t)(sample_count - 1u)) /
-                             (uint64_t)(draw_points - 1u));
+          src_f = ((float)i * (float)(sample_count - 1u)) /
+                  (float)(draw_points - 1u);
+          src_i = (uint32_t)(src_f + 0.5f);
+          if (src_i >= sample_count)
+            src_i = sample_count - 1u;
         }
         idx = (state->history_head + STYGIAN_PERF_HISTORY_MAX - sample_count +
                src_i) %
@@ -1045,18 +1063,25 @@ void stygian_perf_widget(StygianContext *ctx, StygianFont font,
           px = graph_x + (graph_w * ((float)i / (float)(draw_points - 1u)));
         }
         py = line_y + graph_h - (t * graph_h);
+        // Pixel-snap the polyline to avoid shimmering/AA jitter on iGPU.
+        px = floorf(px) + 0.5f;
+        py = floorf(py) + 0.5f;
+
+        // Smooth color ramp based on stress (no threshold flicker).
         stress = ms / frame_target_ms;
-        if (stress > 2.0f) {
-          r = 0.97f;
-          g = 0.30f;
-          b = 0.33f;
-        } else if (stress > 1.0f) {
-          r = 0.97f;
-          g = 0.78f;
-          b = 0.23f;
+        {
+          float u = stress * 0.5f; // 0..2 => 0..1
+          if (u < 0.0f)
+            u = 0.0f;
+          if (u > 1.0f)
+            u = 1.0f;
+          // green -> yellow -> red
+          r = 0.28f + (0.97f - 0.28f) * u;
+          g = 0.90f + (0.30f - 0.90f) * u;
+          b = 0.52f + (0.23f - 0.52f) * u;
         }
         if (has_prev) {
-          stygian_line(ctx, prev_px, prev_py, px, py, 1.5f, r, g, b, 0.95f);
+          stygian_line(ctx, prev_px, prev_py, px, py, 1.0f, r, g, b, 0.95f);
         }
         prev_px = px;
         prev_py = py;

@@ -102,9 +102,14 @@ struct StygianAP {
   StygianAllocator *allocator;
   uint32_t last_upload_bytes;
   uint32_t last_upload_ranges;
+  float last_gpu_ms;
   StygianWindow *window;
   bool initialized;
   StygianAPAdapterClass adapter_class;
+  uint32_t graphics_timestamp_valid_bits;
+  float gpu_timestamp_period_ns;
+  bool gpu_timer_supported;
+  VkQueryPool gpu_timer_query_pool;
   float atlas_width;
   float atlas_height;
   float px_range;
@@ -416,6 +421,7 @@ static bool find_queue_families(StygianAP *ap) {
   for (uint32_t i = 0; i < queue_family_count; i++) {
     if (queue_families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
       ap->graphics_family = i;
+      ap->graphics_timestamp_valid_bits = queue_families[i].timestampValidBits;
       return true;
     }
   }
@@ -458,6 +464,72 @@ static bool create_logical_device(StygianAP *ap) {
   vkGetDeviceQueue(ap->device, ap->graphics_family, 0, &ap->graphics_queue);
   printf("[Stygian AP VK] Logical device created\n");
   return true;
+}
+
+static void init_gpu_timer_support(StygianAP *ap) {
+  VkPhysicalDeviceProperties props;
+  VkQueryPoolCreateInfo query_pool_info;
+
+  if (!ap)
+    return;
+
+  ap->last_gpu_ms = 0.0f;
+  ap->gpu_timer_supported = false;
+  ap->gpu_timestamp_period_ns = 0.0f;
+  ap->gpu_timer_query_pool = VK_NULL_HANDLE;
+
+  vkGetPhysicalDeviceProperties(ap->physical_device, &props);
+  ap->gpu_timestamp_period_ns = props.limits.timestampPeriod;
+
+  if (!props.limits.timestampComputeAndGraphics ||
+      ap->graphics_timestamp_valid_bits == 0 ||
+      ap->gpu_timestamp_period_ns <= 0.0f) {
+    printf("[Stygian AP VK] GPU timer unavailable "
+           "(timestampComputeAndGraphics=%u, validBits=%u)\n",
+           props.limits.timestampComputeAndGraphics ? 1u : 0u,
+           ap->graphics_timestamp_valid_bits);
+    return;
+  }
+
+  memset(&query_pool_info, 0, sizeof(query_pool_info));
+  query_pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+  query_pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+  query_pool_info.queryCount = STYGIAN_VK_FRAMES_IN_FLIGHT * 2u;
+
+  if (vkCreateQueryPool(ap->device, &query_pool_info, NULL,
+                        &ap->gpu_timer_query_pool) != VK_SUCCESS) {
+    printf("[Stygian AP VK] Failed to create GPU timer query pool\n");
+    ap->gpu_timer_query_pool = VK_NULL_HANDLE;
+    return;
+  }
+
+  ap->gpu_timer_supported = true;
+}
+
+static void update_gpu_timer_sample_for_frame(StygianAP *ap,
+                                              uint32_t frame_slot) {
+  uint64_t timestamps[2];
+  uint64_t delta;
+  uint32_t query_base;
+  VkResult result;
+
+  if (!ap || !ap->gpu_timer_supported || !ap->gpu_timer_query_pool)
+    return;
+
+  query_base = frame_slot * 2u;
+  timestamps[0] = 0u;
+  timestamps[1] = 0u;
+  result = vkGetQueryPoolResults(
+      ap->device, ap->gpu_timer_query_pool, query_base, 2u, sizeof(timestamps),
+      timestamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+  if (result != VK_SUCCESS)
+    return;
+  if (timestamps[1] <= timestamps[0])
+    return;
+
+  delta = timestamps[1] - timestamps[0];
+  ap->last_gpu_ms = (float)(((double)delta * (double)ap->gpu_timestamp_period_ns) /
+                            1000000.0);
 }
 
 static bool create_surface(StygianAP *ap) {
@@ -1406,6 +1478,8 @@ StygianAP *stygian_ap_create(const StygianAPConfig *config) {
     return NULL;
   }
 
+  init_gpu_timer_support(ap);
+
   // Create surface
   if (!create_surface(ap)) {
     vkDestroyDevice(ap->device, NULL);
@@ -1605,6 +1679,8 @@ void stygian_ap_destroy(StygianAP *ap) {
   // Destroy command pool (frees command buffers automatically)
   if (ap->command_pool)
     vkDestroyCommandPool(ap->device, ap->command_pool, NULL);
+  if (ap->gpu_timer_query_pool)
+    vkDestroyQueryPool(ap->device, ap->gpu_timer_query_pool, NULL);
 
   if (ap->graphics_pipeline)
     vkDestroyPipeline(ap->device, ap->graphics_pipeline, NULL);
@@ -1703,6 +1779,16 @@ uint32_t stygian_ap_get_last_upload_ranges(const StygianAP *ap) {
   return ap->last_upload_ranges;
 }
 
+float stygian_ap_get_last_gpu_ms(const StygianAP *ap) {
+  if (!ap)
+    return 0.0f;
+  return ap->last_gpu_ms;
+}
+
+void stygian_ap_gpu_timer_begin(StygianAP *ap) { (void)ap; }
+
+void stygian_ap_gpu_timer_end(StygianAP *ap) { (void)ap; }
+
 void stygian_ap_begin_frame(StygianAP *ap, int width, int height) {
   if (!ap)
     return;
@@ -1760,6 +1846,7 @@ void stygian_ap_begin_frame(StygianAP *ap, int width, int height) {
   // Wait for previous frame to finish
   vkWaitForFences(ap->device, 1, &ap->in_flight[ap->current_frame], VK_TRUE,
                   UINT64_MAX);
+  update_gpu_timer_sample_for_frame(ap, ap->current_frame);
 
   // Acquire next swapchain image
   double acquire_t0 = stygian_vk_now_ms();
@@ -1811,6 +1898,13 @@ void stygian_ap_begin_frame(StygianAP *ap, int width, int height) {
       .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
   };
   vkBeginCommandBuffer(cmd, &begin_info);
+
+  if (ap->gpu_timer_supported && ap->gpu_timer_query_pool) {
+    uint32_t query_base = ap->current_frame * 2u;
+    vkCmdResetQueryPool(cmd, ap->gpu_timer_query_pool, query_base, 2u);
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                        ap->gpu_timer_query_pool, query_base);
+  }
 
   // Begin render pass
   VkClearValue clear_color = {{{0.1f, 0.1f, 0.1f, 1.0f}}};
@@ -2009,6 +2103,12 @@ void stygian_ap_end_frame(StygianAP *ap) {
   // End render pass
   VkCommandBuffer cmd = ap->command_buffers[ap->current_frame];
   vkCmdEndRenderPass(cmd);
+
+  if (ap->gpu_timer_supported && ap->gpu_timer_query_pool) {
+    uint32_t query_base = ap->current_frame * 2u;
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                        ap->gpu_timer_query_pool, query_base + 1u);
+  }
 
   // End command buffer
   VkResult result = vkEndCommandBuffer(cmd);

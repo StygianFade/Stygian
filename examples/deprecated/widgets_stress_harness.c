@@ -1,4 +1,4 @@
-#include "../include/stygian.h"
+﻿#include "../include/stygian.h"
 #include "../widgets/stygian_widgets.h"
 #include "../window/stygian_input.h"
 #include "../window/stygian_window.h"
@@ -7,8 +7,12 @@
 #include <time.h>
 
 #define HARNESS_MAX_ROWS 2048
-static const StygianScopeId k_scope_base = 0x2001ull;
-static const StygianScopeId k_scope_perf = 0x2002ull;
+static const StygianScopeId k_scope_chrome = 0x2001ull;
+static const StygianScopeId k_scope_list_shell = 0x2003ull;
+static const StygianScopeId k_scope_list_rows = 0x2005ull;
+static const StygianScopeId k_scope_popup = 0x2004ull;
+static const StygianScopeId k_scope_perf =
+    STYGIAN_OVERLAY_SCOPE_BASE | (StygianScopeId)0x2002ull;
 
 static bool g_row_enabled[HARNESS_MAX_ROWS];
 static float g_row_weight[HARNESS_MAX_ROWS];
@@ -54,10 +58,10 @@ int main(void) {
       .enabled = true,
       .show_graph = true,
       .show_input = true,
-      .auto_scale_graph = true,
+      .auto_scale_graph = false,
       .history_window = 120u,
       .idle_hz = 30u,
-      .active_hz = 60u,
+      .active_hz = 30u,
       .text_hz = 5u,
       .max_stress_hz = 120u,
       .stress_mode = false,
@@ -97,7 +101,12 @@ int main(void) {
     StygianEvent ev;
     bool event_mutated = false;
     bool event_requested = false;
-    bool ui_state_changed = false;
+    bool event_eval = false;
+    bool chrome_changed = false;
+    bool list_shell_changed = false;
+    bool list_rows_changed = false;
+    bool popup_changed = false;
+    bool any_state_changed;
     bool repaint_pending;
     uint32_t wait_ms = stygian_next_repaint_wait_ms(ctx, 250u);
     static bool first_frame = true;
@@ -124,11 +133,13 @@ int main(void) {
         event_mutated = true;
       if (impact & STYGIAN_IMPACT_REQUEST_REPAINT)
         event_requested = true;
+      if (impact & STYGIAN_IMPACT_REQUEST_EVAL)
+        event_eval = true;
       if (ev.type == STYGIAN_EVENT_CLOSE)
         running = false;
     }
 
-    if (!event_mutated && !event_requested && !first_frame) {
+    if (!event_mutated && !event_requested && !event_eval && !first_frame) {
       if (stygian_window_wait_event_timeout(win, &ev, wait_ms)) {
         StygianWidgetEventImpact impact =
             stygian_widgets_process_event_ex(ctx, &ev);
@@ -136,6 +147,8 @@ int main(void) {
           event_mutated = true;
         if (impact & STYGIAN_IMPACT_REQUEST_REPAINT)
           event_requested = true;
+        if (impact & STYGIAN_IMPACT_REQUEST_EVAL)
+          event_eval = true;
         if (ev.type == STYGIAN_EVENT_CLOSE)
           running = false;
         while (stygian_window_poll_event(win, &ev)) {
@@ -145,6 +158,8 @@ int main(void) {
             event_mutated = true;
           if (queued_impact & STYGIAN_IMPACT_REQUEST_REPAINT)
             event_requested = true;
+          if (queued_impact & STYGIAN_IMPACT_REQUEST_EVAL)
+            event_eval = true;
           if (ev.type == STYGIAN_EVENT_CLOSE)
             running = false;
         }
@@ -152,13 +167,10 @@ int main(void) {
     }
 
     repaint_pending = stygian_has_pending_repaint(ctx);
-    if (!event_mutated && !event_requested && !first_frame && !repaint_pending) {
+    bool render_frame = first_frame || event_mutated || repaint_pending;
+    bool eval_only_frame = (!render_frame && (event_eval || event_requested));
+    if (!render_frame && !eval_only_frame) {
       continue;
-    }
-    if (event_mutated) {
-      // Event-driven mutations must rebuild this scope now, not next frame.
-      stygian_scope_invalidate_now(ctx, k_scope_base);
-      stygian_set_repaint_source(ctx, "event-mutation");
     }
     first_frame = false;
 
@@ -186,14 +198,17 @@ int main(void) {
         list_scroll_y = max_scroll;
     }
     if (list_scroll_y != prev_scroll_y) {
-      ui_state_changed = true;
+      list_shell_changed = true;
+      list_rows_changed = true;
     }
 
-    if (show_perf && repaint_pending) {
+    if (!eval_only_frame && show_perf && (repaint_pending || event_requested)) {
       stygian_scope_invalidate_now(ctx, k_scope_perf);
     }
-    stygian_begin_frame(ctx, ww, wh);
-    stygian_scope_begin(ctx, k_scope_base);
+    stygian_begin_frame_intent(
+        ctx, ww, wh,
+        eval_only_frame ? STYGIAN_FRAME_EVAL_ONLY : STYGIAN_FRAME_RENDER);
+    stygian_scope_begin(ctx, k_scope_chrome);
 
     stygian_rect(ctx, 0.0f, 0.0f, (float)ww, (float)wh, 0.07f, 0.08f, 0.10f,
                  1.0f);
@@ -211,17 +226,17 @@ int main(void) {
     if (stygian_button(ctx, font, show_perf ? "Perf: ON" : "Perf: OFF", 26.0f,
                        46.0f, 110.0f, 28.0f)) {
       show_perf = !show_perf;
-      ui_state_changed = true;
+      chrome_changed = true;
     }
     if (stygian_button(ctx, font,
                        show_overlays ? "Overlays: ON" : "Overlays: OFF", 144.0f,
                        46.0f, 130.0f, 28.0f)) {
       show_overlays = !show_overlays;
-      ui_state_changed = true;
+      chrome_changed = true;
     }
     if (stygian_button(ctx, font, "Open Modal", 282.0f, 46.0f, 120.0f, 28.0f)) {
       modal.open = true;
-      ui_state_changed = true;
+      popup_changed = true;
     }
 
     if (stygian_slider(ctx, 420.0f, 52.0f, 240.0f, 18.0f, &rows_f, 64.0f,
@@ -231,7 +246,9 @@ int main(void) {
         rows = 64;
       if (rows > HARNESS_MAX_ROWS)
         rows = HARNESS_MAX_ROWS;
-      ui_state_changed = true;
+      chrome_changed = true;
+      list_shell_changed = true;
+      list_rows_changed = true;
     }
     if (font) {
       char rows_text[64];
@@ -239,15 +256,18 @@ int main(void) {
       stygian_text(ctx, font, rows_text, 668.0f, 49.0f, 14.0f, 0.84f, 0.90f,
                    0.95f, 1.0f);
     }
+    stygian_scope_end(ctx);
 
+    stygian_scope_begin(ctx, k_scope_list_shell);
     if (stygian_context_menu_trigger_region(ctx, &menu, panel_x, panel_y,
                                             panel_w, panel_h)) {
-      ui_state_changed = true;
+      popup_changed = true;
     }
     stygian_rect_rounded(ctx, panel_x, panel_y, panel_w, panel_h, 0.10f, 0.11f,
                          0.13f, 0.94f, 8.0f);
     stygian_clip_push(ctx, panel_x + 8.0f, panel_y + 8.0f, panel_w - 24.0f,
                       panel_h - 16.0f);
+    stygian_scope_begin(ctx, k_scope_list_rows);
 
     start_row = (int)(list_scroll_y / row_h);
     if (start_row < 0)
@@ -267,11 +287,11 @@ int main(void) {
       snprintf(id_text, sizeof(id_text), "Row %d", i);
       if (stygian_checkbox(ctx, font, id_text, panel_x + 14.0f, ry + 6.0f,
                            &g_row_enabled[i])) {
-        ui_state_changed = true;
+        list_rows_changed = true;
       }
       if (stygian_slider(ctx, panel_x + 210.0f, ry + 8.0f, 220.0f, 14.0f,
                          &g_row_weight[i], 0.0f, 1.0f)) {
-        ui_state_changed = true;
+        list_rows_changed = true;
       }
       if (stygian_button(ctx, font, "Ping", panel_x + 450.0f, ry + 4.0f, 64.0f,
                          22.0f)) {
@@ -280,10 +300,13 @@ int main(void) {
       }
     }
 
+    stygian_scope_end(ctx);
+
     stygian_clip_pop(ctx);
     if (stygian_scrollbar_v(ctx, panel_x + panel_w - 11.0f, panel_y + 6.0f,
                             7.0f, panel_h - 12.0f, content_h, &list_scroll_y)) {
-      ui_state_changed = true;
+      list_shell_changed = true;
+      list_rows_changed = true;
     }
 
     if (show_overlays && panel_hovered && font) {
@@ -296,22 +319,25 @@ int main(void) {
       };
       stygian_tooltip(ctx, font, &tip);
     }
+    stygian_scope_end(ctx);
 
+    stygian_scope_begin(ctx, k_scope_popup);
     if (stygian_context_menu_begin(ctx, font, &menu, 3)) {
       if (stygian_context_menu_item(ctx, font, &menu, "Open modal", 0)) {
         modal.open = true;
-        ui_state_changed = true;
+        popup_changed = true;
       }
       if (stygian_context_menu_item(ctx, font, &menu, "Reset scroll", 1)) {
         list_scroll_y = 0.0f;
-        ui_state_changed = true;
+        list_shell_changed = true;
+        list_rows_changed = true;
       }
       if (stygian_context_menu_item(ctx, font, &menu, "Randomize weights", 2)) {
         for (i = 0; i < rows; ++i) {
           uint32_t seed = (uint32_t)(i * 2654435761u + 0x9e3779b9u);
           g_row_weight[i] = (float)(seed % 1000u) / 1000.0f;
         }
-        ui_state_changed = true;
+        list_rows_changed = true;
       }
       stygian_context_menu_end(ctx, &menu);
     }
@@ -330,18 +356,27 @@ int main(void) {
         if (stygian_button(ctx, font, "Close", mx0 + modal.w - 94.0f,
                            my0 + modal.h - 42.0f, 74.0f, 28.0f)) {
           modal.open = false;
-          ui_state_changed = true;
+          popup_changed = true;
         }
         stygian_modal_end(ctx, &modal);
       }
     }
 
     stygian_scope_end(ctx);
-    if (ui_state_changed && !event_mutated) {
-      // Programmatic mutations (non-input) schedule a rebuild on next frame.
-      stygian_scope_invalidate_next(ctx, k_scope_base);
+    any_state_changed =
+        chrome_changed || list_shell_changed || list_rows_changed || popup_changed;
+    if (any_state_changed) {
+      // Schedule targeted scope rebuilds for the next frame.
+      if (chrome_changed)
+        stygian_scope_invalidate_next(ctx, k_scope_chrome);
+      if (list_shell_changed)
+        stygian_scope_invalidate_next(ctx, k_scope_list_shell);
+      if (list_rows_changed)
+        stygian_scope_invalidate_next(ctx, k_scope_list_rows);
+      if (popup_changed)
+        stygian_scope_invalidate_next(ctx, k_scope_popup);
       stygian_set_repaint_source(ctx, "mutation");
-      stygian_request_repaint_after_ms(ctx, 1u);
+      stygian_request_repaint_after_ms(ctx, 0u);
     }
 
     if (show_perf) {

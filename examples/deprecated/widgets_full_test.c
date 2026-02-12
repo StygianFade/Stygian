@@ -1,4 +1,4 @@
-// widgets_full_test.c - Complete Widget & Tab System Test
+﻿// widgets_full_test.c - Complete Widget & Tab System Test
 // Tests: checkbox, radio buttons, tabs with reordering
 
 #include "../include/stygian.h"
@@ -69,10 +69,10 @@ int main(int argc, char **argv) {
       .enabled = true,
       .show_graph = true,
       .show_input = true,
-      .auto_scale_graph = true,
+      .auto_scale_graph = false,
       .history_window = 120u,
       .idle_hz = 30u,
-      .active_hz = 60u,
+      .active_hz = 30u,
       .text_hz = 5u,
       .max_stress_hz = 120u,
       .stress_mode = false,
@@ -90,15 +90,20 @@ int main(int argc, char **argv) {
   printf("  3. Tab system with reordering\n");
   printf("  4. Slider widget\n\n");
 
-  const StygianScopeId k_scope_base = 0x1001u;
-  const StygianScopeId k_scope_perf = 0x1002u;
+  const StygianScopeId k_scope_chrome = 0x1001u;
+  const StygianScopeId k_scope_content = 0x1003u;
+  const StygianScopeId k_scope_perf =
+      STYGIAN_OVERLAY_SCOPE_BASE | (StygianScopeId)0x1002u;
 
   while (!stygian_window_should_close(window)) {
     StygianEvent event;
     static bool first_frame = true;
     bool event_mutated = false;
     bool event_requested = false;
-    bool ui_state_changed = false;
+    bool event_eval = false;
+    bool chrome_changed = false;
+    bool content_changed = false;
+    bool any_state_changed = false;
     uint32_t wait_ms = stygian_next_repaint_wait_ms(ctx, 250u);
     bool repaint_pending = stygian_has_pending_repaint(ctx);
     stygian_widgets_begin_frame(ctx);
@@ -109,12 +114,14 @@ int main(int argc, char **argv) {
         event_mutated = true;
       if (impact & STYGIAN_IMPACT_REQUEST_REPAINT)
         event_requested = true;
+      if (impact & STYGIAN_IMPACT_REQUEST_EVAL)
+        event_eval = true;
       if (event.type == STYGIAN_EVENT_CLOSE) {
         stygian_window_request_close(window);
       }
     }
 
-    if (!event_mutated && !event_requested && !first_frame) {
+    if (!event_mutated && !event_requested && !event_eval && !first_frame) {
       if (stygian_window_wait_event_timeout(window, &event, wait_ms)) {
         StygianWidgetEventImpact impact =
             stygian_widgets_process_event_ex(ctx, &event);
@@ -122,6 +129,8 @@ int main(int argc, char **argv) {
           event_mutated = true;
         if (impact & STYGIAN_IMPACT_REQUEST_REPAINT)
           event_requested = true;
+        if (impact & STYGIAN_IMPACT_REQUEST_EVAL)
+          event_eval = true;
         if (event.type == STYGIAN_EVENT_CLOSE) {
           stygian_window_request_close(window);
         }
@@ -132,6 +141,8 @@ int main(int argc, char **argv) {
             event_mutated = true;
           if (queued_impact & STYGIAN_IMPACT_REQUEST_REPAINT)
             event_requested = true;
+          if (queued_impact & STYGIAN_IMPACT_REQUEST_EVAL)
+            event_eval = true;
           if (event.type == STYGIAN_EVENT_CLOSE) {
             stygian_window_request_close(window);
           }
@@ -140,13 +151,13 @@ int main(int argc, char **argv) {
     }
 
     repaint_pending = stygian_has_pending_repaint(ctx);
-    if (!event_mutated && !event_requested && !first_frame && !repaint_pending) {
+    bool render_frame = first_frame || event_mutated || repaint_pending;
+    bool eval_only_frame = (!render_frame && (event_eval || event_requested));
+    if (!render_frame && !eval_only_frame) {
       continue;
     }
-    if (event_mutated) {
-      // Event-driven mutations must rebuild this scope now, not next frame.
-      stygian_scope_invalidate_now(ctx, k_scope_base);
-      stygian_set_repaint_source(ctx, "event-mutation");
+    if (!eval_only_frame && (repaint_pending || event_requested)) {
+      stygian_scope_invalidate_now(ctx, k_scope_perf);
     }
     first_frame = false;
 
@@ -157,11 +168,10 @@ int main(int argc, char **argv) {
     // tab_bar->w = (float)width; // Not accessible anymore, re-create or ignore
     // for now
 
-    if (repaint_pending) {
-      stygian_scope_invalidate_now(ctx, k_scope_perf);
-    }
-    stygian_begin_frame(ctx, width, height);
-    stygian_scope_begin(ctx, k_scope_base);
+    stygian_begin_frame_intent(
+        ctx, width, height,
+        eval_only_frame ? STYGIAN_FRAME_EVAL_ONLY : STYGIAN_FRAME_RENDER);
+    stygian_scope_begin(ctx, k_scope_chrome);
 
     // Background
     stygian_rect(ctx, 0, 0, (float)width, (float)height, 0.08f, 0.08f, 0.08f,
@@ -169,7 +179,8 @@ int main(int argc, char **argv) {
     // Tab bar
     int tab_result = stygian_tab_bar_update(ctx, font, tab_bar);
     if (tab_result != 0) {
-      ui_state_changed = true;
+      chrome_changed = true;
+      content_changed = true;
     }
     if (tab_result == 1) {
       printf("Tab switched to: %s\n",
@@ -183,7 +194,9 @@ int main(int argc, char **argv) {
         printf("  %d: %s\n", i, stygian_tab_bar_get_title(tab_bar, i));
       }
     }
+    stygian_scope_end(ctx);
 
+    stygian_scope_begin(ctx, k_scope_content);
     // Content area
     float content_y = 32.0f + 20;
     float content_h = height - content_y - 20;
@@ -211,17 +224,17 @@ int main(int argc, char **argv) {
 
     if (stygian_checkbox(ctx, font, "Option 1", 60, content_y + 100,
                          &checkbox1)) {
-      ui_state_changed = true;
+      content_changed = true;
       printf("Checkbox 1 toggled: %s\n", checkbox1 ? "ON" : "OFF");
     }
     if (stygian_checkbox(ctx, font, "Option 2", 60, content_y + 130,
                          &checkbox2)) {
-      ui_state_changed = true;
+      content_changed = true;
       printf("Checkbox 2 toggled: %s\n", checkbox2 ? "ON" : "OFF");
     }
     if (stygian_checkbox(ctx, font, "Option 3", 60, content_y + 160,
                          &checkbox3)) {
-      ui_state_changed = true;
+      content_changed = true;
       printf("Checkbox 3 toggled: %s\n", checkbox3 ? "ON" : "OFF");
     }
 
@@ -233,17 +246,17 @@ int main(int argc, char **argv) {
 
     if (stygian_radio_button(ctx, font, "Choice A", 60, content_y + 240,
                              &radio_selection, 0)) {
-      ui_state_changed = true;
+      content_changed = true;
       printf("Radio selected: Choice A\n");
     }
     if (stygian_radio_button(ctx, font, "Choice B", 60, content_y + 270,
                              &radio_selection, 1)) {
-      ui_state_changed = true;
+      content_changed = true;
       printf("Radio selected: Choice B\n");
     }
     if (stygian_radio_button(ctx, font, "Choice C", 60, content_y + 300,
                              &radio_selection, 2)) {
-      ui_state_changed = true;
+      content_changed = true;
       printf("Radio selected: Choice C\n");
     }
 
@@ -255,7 +268,7 @@ int main(int argc, char **argv) {
 
     if (stygian_slider(ctx, 60, content_y + 380, 300, 20, &slider_value, 0.0f,
                        1.0f)) {
-      ui_state_changed = true;
+      content_changed = true;
       printf("Slider value: %.2f\n", slider_value);
     }
 
@@ -333,21 +346,25 @@ int main(int argc, char **argv) {
         stygian_clip_pop(ctx);
         if (stygian_scrollbar_v(ctx, vx + vw - 10.0f, vy + 6.0f, 6.0f,
                                 vh - 12.0f, content_h, &custom_scroll)) {
-          ui_state_changed = true;
+          content_changed = true;
         }
         if (custom_scroll != prev_scroll) {
-          ui_state_changed = true;
+          content_changed = true;
         }
       }
     }
 
     stygian_panel_end(ctx);
     stygian_scope_end(ctx);
-    if (ui_state_changed && !event_mutated) {
-      // Programmatic mutations (non-input) schedule a rebuild on next frame.
-      stygian_scope_invalidate_next(ctx, k_scope_base);
+    any_state_changed = chrome_changed || content_changed;
+    if (any_state_changed) {
+      // Schedule targeted scope rebuilds for the next frame.
+      if (chrome_changed)
+        stygian_scope_invalidate_next(ctx, k_scope_chrome);
+      if (content_changed)
+        stygian_scope_invalidate_next(ctx, k_scope_content);
       stygian_set_repaint_source(ctx, "mutation");
-      stygian_request_repaint_after_ms(ctx, 1u);
+      stygian_request_repaint_after_ms(ctx, 0u);
     }
 
     stygian_scope_begin(ctx, k_scope_perf);

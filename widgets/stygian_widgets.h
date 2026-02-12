@@ -126,6 +126,7 @@ typedef uint32_t StygianWidgetEventImpact;
 #define STYGIAN_IMPACT_POINTER_ONLY (1u << 0)
 #define STYGIAN_IMPACT_MUTATED_STATE (1u << 1)
 #define STYGIAN_IMPACT_REQUEST_REPAINT (1u << 2)
+#define STYGIAN_IMPACT_REQUEST_EVAL (1u << 3)
 #define STYGIAN_IMPACT_LAYOUT_CHANGED STYGIAN_IMPACT_MUTATED_STATE
 
 typedef uint32_t StygianWidgetRegionFlags;
@@ -201,6 +202,8 @@ typedef struct StygianPerfWidget {
   uint32_t active_hz;      // 0 = default 60
   uint32_t text_hz;        // 0 = default 5
   uint32_t graph_max_segments; // 0 = default 64
+  float graph_scale_ms;    // Smoothed Y-scale for graph autoscale
+  float graph_filtered_ms; // Smoothed graph sample value
   uint32_t max_stress_hz;  // 0 = disabled, else upper bound (e.g. 120/144)
   bool stress_mode;        // when true, use max_stress_hz for diagnostics tick
   uint32_t budget_miss_count;

@@ -54,10 +54,17 @@ struct StygianWindow {
   bool in_size_move;
   UINT_PTR live_tick_timer_id;
   uint32_t live_tick_hz;
+  bool nc_drag_active;
+  int nc_drag_hit;
+  POINT nc_drag_start_cursor;
+  RECT nc_drag_start_rect;
 };
 
 static const UINT_PTR STYGIAN_WIN32_LIVE_TICK_TIMER_ID = 0x51A7u;
 static const uint32_t STYGIAN_WIN32_DEFAULT_LIVE_TICK_HZ = 30u;
+static const int STYGIAN_WIN32_MIN_TRACK_W = 320;
+static const int STYGIAN_WIN32_MIN_TRACK_H = 200;
+static void push_event(StygianWindow *win, StygianEvent *e);
 
 static void stygian_win32_start_live_ticks(StygianWindow *win, uint32_t hz) {
   UINT interval_ms;
@@ -79,6 +86,115 @@ static void stygian_win32_stop_live_ticks(StygianWindow *win) {
     KillTimer(win->hwnd, win->live_tick_timer_id);
     win->live_tick_timer_id = 0u;
   }
+}
+
+static bool stygian_win32_is_resize_hit(int hit) {
+  switch (hit) {
+  case HTLEFT:
+  case HTRIGHT:
+  case HTTOP:
+  case HTBOTTOM:
+  case HTTOPLEFT:
+  case HTTOPRIGHT:
+  case HTBOTTOMLEFT:
+  case HTBOTTOMRIGHT:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool stygian_win32_is_move_or_resize_hit(int hit) {
+  return (hit == HTCAPTION) || stygian_win32_is_resize_hit(hit);
+}
+
+static void stygian_win32_end_nc_drag(StygianWindow *win) {
+  StygianEvent e = {0};
+  if (!win || !win->nc_drag_active)
+    return;
+  win->nc_drag_active = false;
+  win->nc_drag_hit = 0;
+  win->in_size_move = false;
+  stygian_win32_stop_live_ticks(win);
+  ReleaseCapture();
+  e.type = STYGIAN_EVENT_TICK;
+  push_event(win, &e);
+}
+
+static void stygian_win32_apply_nc_drag(StygianWindow *win) {
+  POINT cursor;
+  RECT next_rect;
+  LONG dx;
+  LONG dy;
+  LONG min_w = STYGIAN_WIN32_MIN_TRACK_W;
+  LONG min_h = STYGIAN_WIN32_MIN_TRACK_H;
+  if (!win || !win->nc_drag_active)
+    return;
+  if (!GetCursorPos(&cursor))
+    return;
+
+  dx = cursor.x - win->nc_drag_start_cursor.x;
+  dy = cursor.y - win->nc_drag_start_cursor.y;
+  next_rect = win->nc_drag_start_rect;
+
+  if (win->nc_drag_hit == HTCAPTION) {
+    OffsetRect(&next_rect, dx, dy);
+  } else {
+    switch (win->nc_drag_hit) {
+    case HTLEFT:
+      next_rect.left += dx;
+      break;
+    case HTRIGHT:
+      next_rect.right += dx;
+      break;
+    case HTTOP:
+      next_rect.top += dy;
+      break;
+    case HTBOTTOM:
+      next_rect.bottom += dy;
+      break;
+    case HTTOPLEFT:
+      next_rect.left += dx;
+      next_rect.top += dy;
+      break;
+    case HTTOPRIGHT:
+      next_rect.right += dx;
+      next_rect.top += dy;
+      break;
+    case HTBOTTOMLEFT:
+      next_rect.left += dx;
+      next_rect.bottom += dy;
+      break;
+    case HTBOTTOMRIGHT:
+      next_rect.right += dx;
+      next_rect.bottom += dy;
+      break;
+    default:
+      break;
+    }
+
+    if (next_rect.right - next_rect.left < min_w) {
+      if (win->nc_drag_hit == HTLEFT || win->nc_drag_hit == HTTOPLEFT ||
+          win->nc_drag_hit == HTBOTTOMLEFT) {
+        next_rect.left = next_rect.right - min_w;
+      } else {
+        next_rect.right = next_rect.left + min_w;
+      }
+    }
+    if (next_rect.bottom - next_rect.top < min_h) {
+      if (win->nc_drag_hit == HTTOP || win->nc_drag_hit == HTTOPLEFT ||
+          win->nc_drag_hit == HTTOPRIGHT) {
+        next_rect.top = next_rect.bottom - min_h;
+      } else {
+        next_rect.bottom = next_rect.top + min_h;
+      }
+    }
+  }
+
+  SetWindowPos(win->hwnd, NULL, next_rect.left, next_rect.top,
+               next_rect.right - next_rect.left,
+               next_rect.bottom - next_rect.top,
+               SWP_NOACTIVATE | SWP_NOZORDER);
 }
 
 static bool stygian_win32_use_dwm_flush(void) {
@@ -178,9 +294,20 @@ static void push_event(StygianWindow *win, StygianEvent *e) {
          win->events[prev].type == STYGIAN_EVENT_MOUSE_MOVE) ||
         (e->type == STYGIAN_EVENT_RESIZE &&
          win->events[prev].type == STYGIAN_EVENT_RESIZE) ||
+        (e->type == STYGIAN_EVENT_SCROLL &&
+         win->events[prev].type == STYGIAN_EVENT_SCROLL) ||
         (e->type == STYGIAN_EVENT_TICK &&
          win->events[prev].type == STYGIAN_EVENT_TICK)) {
-      win->events[prev] = *e;
+      if (e->type == STYGIAN_EVENT_SCROLL &&
+          win->events[prev].type == STYGIAN_EVENT_SCROLL) {
+        // Merge wheel bursts into one event to avoid queue tail-lag.
+        win->events[prev].scroll.dx += e->scroll.dx;
+        win->events[prev].scroll.dy += e->scroll.dy;
+        win->events[prev].scroll.x = e->scroll.x;
+        win->events[prev].scroll.y = e->scroll.y;
+      } else {
+        win->events[prev] = *e;
+      }
       return;
     }
   }
@@ -222,17 +349,13 @@ static LRESULT CALLBACK win32_wndproc(HWND hwnd, UINT msg, WPARAM wp,
     return 0;
 
   case WM_ENTERSIZEMOVE:
-    win->in_size_move = true;
-    stygian_win32_start_live_ticks(win, win->live_tick_hz);
-    e.type = STYGIAN_EVENT_TICK;
-    push_event(win, &e);
     return 0;
 
   case WM_EXITSIZEMOVE:
-    win->in_size_move = false;
-    stygian_win32_stop_live_ticks(win);
-    e.type = STYGIAN_EVENT_TICK;
-    push_event(win, &e);
+    return 0;
+
+  case WM_MOVING:
+  case WM_SIZING:
     return 0;
 
   case WM_SETFOCUS:
@@ -316,7 +439,35 @@ static LRESULT CALLBACK win32_wndproc(HWND hwnd, UINT msg, WPARAM wp,
     e.mouse_button.mods = get_mods();
     win->mouse_buttons[e.mouse_button.button] = false;
     push_event(win, &e);
-    ReleaseCapture();
+    if (win->nc_drag_active) {
+      stygian_win32_end_nc_drag(win);
+    } else {
+      ReleaseCapture();
+    }
+    return 0;
+
+  case WM_NCLBUTTONDOWN: {
+    int hit = (int)wp;
+    if (stygian_win32_is_move_or_resize_hit(hit)) {
+      win->nc_drag_active = true;
+      win->nc_drag_hit = hit;
+      win->in_size_move = true;
+      stygian_win32_start_live_ticks(win, win->live_tick_hz);
+      GetCursorPos(&win->nc_drag_start_cursor);
+      GetWindowRect(hwnd, &win->nc_drag_start_rect);
+      SetCapture(hwnd);
+      e.type = STYGIAN_EVENT_TICK;
+      push_event(win, &e);
+      return 0;
+    }
+  } break;
+
+  case WM_NCLBUTTONUP:
+    stygian_win32_end_nc_drag(win);
+    return 0;
+
+  case WM_CAPTURECHANGED:
+    stygian_win32_end_nc_drag(win);
     return 0;
 
   case WM_MOUSEWHEEL:
@@ -329,7 +480,11 @@ static LRESULT CALLBACK win32_wndproc(HWND hwnd, UINT msg, WPARAM wp,
     return 0;
 
   case WM_TIMER:
-    if (wp == STYGIAN_WIN32_LIVE_TICK_TIMER_ID && win->in_size_move) {
+    if (wp == STYGIAN_WIN32_LIVE_TICK_TIMER_ID &&
+        (win->in_size_move || win->nc_drag_active)) {
+      if (win->nc_drag_active) {
+        stygian_win32_apply_nc_drag(win);
+      }
       e.type = STYGIAN_EVENT_TICK;
       push_event(win, &e);
       return 0;
@@ -641,6 +796,16 @@ bool stygian_window_wait_event_timeout(StygianWindow *win, StygianEvent *event,
   DWORD wait_res;
   if (!win || !win->hwnd || !event)
     return false;
+
+  if (win->in_size_move) {
+    uint32_t hz = win->live_tick_hz ? win->live_tick_hz
+                                    : STYGIAN_WIN32_DEFAULT_LIVE_TICK_HZ;
+    uint32_t tick_ms = 1000u / hz;
+    if (tick_ms < 1u)
+      tick_ms = 1u;
+    if (timeout_ms == 0u || timeout_ms > tick_ms)
+      timeout_ms = tick_ms;
+  }
 
   // Fast path: already queued.
   if (win->event_head != win->event_tail) {

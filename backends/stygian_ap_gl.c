@@ -110,6 +110,15 @@ typedef float GLfloat;
 #ifndef GL_TEXTURE0
 #define GL_TEXTURE0 0x84C0
 #endif
+#ifndef GL_TIME_ELAPSED
+#define GL_TIME_ELAPSED 0x88BF
+#endif
+#ifndef GL_QUERY_RESULT
+#define GL_QUERY_RESULT 0x8866
+#endif
+#ifndef GL_QUERY_RESULT_AVAILABLE
+#define GL_QUERY_RESULT_AVAILABLE 0x8867
+#endif
 
 // ============================================================================
 // OpenGL Function Pointers
@@ -191,6 +200,18 @@ typedef void (*PFNGLDELETESHADERPROC)(GLuint);
 typedef void (*PFNGLVALIDATEPROGRAMPROC)(GLuint);
 static PFNGLDELETESHADERPROC glDeleteShader;
 static PFNGLVALIDATEPROGRAMPROC glValidateProgram;
+typedef void (*PFNGLGENQUERIESPROC)(GLsizei, GLuint *);
+typedef void (*PFNGLDELETEQUERIESPROC)(GLsizei, const GLuint *);
+typedef void (*PFNGLBEGINQUERYPROC)(GLenum, GLuint);
+typedef void (*PFNGLENDQUERYPROC)(GLenum);
+typedef void (*PFNGLGETQUERYOBJECTIVPROC)(GLuint, GLenum, GLint *);
+typedef void (*PFNGLGETQUERYOBJECTUI64VPROC)(GLuint, GLenum, uint64_t *);
+static PFNGLGENQUERIESPROC glGenQueries;
+static PFNGLDELETEQUERIESPROC glDeleteQueries;
+static PFNGLBEGINQUERYPROC glBeginQuery;
+static PFNGLENDQUERYPROC glEndQuery;
+static PFNGLGETQUERYOBJECTIVPROC glGetQueryObjectiv;
+static PFNGLGETQUERYOBJECTUI64VPROC glGetQueryObjectui64v;
 
 static void load_gl(void **ptr, const char *name) {
   *ptr = stygian_window_gl_get_proc_address(name);
@@ -246,6 +267,12 @@ struct StygianAP {
 
   uint32_t last_upload_bytes;
   uint32_t last_upload_ranges;
+  float last_gpu_ms;
+  GLuint gpu_queries[2];
+  uint8_t gpu_query_index;
+  bool gpu_query_initialized;
+  bool gpu_query_in_flight;
+  bool gpu_query_pending[2];
 
   // SoA SSBOs (3 buffers: hot, appearance, effects)
   GLuint soa_ssbo_hot;
@@ -670,6 +697,12 @@ StygianAP *stygian_ap_create(const StygianAPConfig *config) {
   LOAD_GL(glActiveTexture);
   LOAD_GL(glDeleteShader);
   LOAD_GL(glValidateProgram);
+  LOAD_GL(glGenQueries);
+  LOAD_GL(glDeleteQueries);
+  LOAD_GL(glBeginQuery);
+  LOAD_GL(glEndQuery);
+  LOAD_GL(glGetQueryObjectiv);
+  LOAD_GL(glGetQueryObjectui64v);
 
   // Check GL version
   const char *version = (const char *)glGetString(GL_VERSION);
@@ -722,6 +755,21 @@ StygianAP *stygian_ap_create(const StygianAPConfig *config) {
                ap->max_elements * sizeof(StygianSoAEffects), NULL,
                GL_DYNAMIC_DRAW);
   glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, ap->soa_ssbo_effects);
+
+  // Optional GPU timing queries (GL_TIME_ELAPSED).
+  ap->gpu_query_initialized =
+      (glGenQueries && glDeleteQueries && glBeginQuery && glEndQuery &&
+       glGetQueryObjectiv && glGetQueryObjectui64v);
+  ap->gpu_query_in_flight = false;
+  ap->gpu_query_index = 0u;
+  ap->last_gpu_ms = 0.0f;
+  ap->gpu_queries[0] = 0u;
+  ap->gpu_queries[1] = 0u;
+  ap->gpu_query_pending[0] = false;
+  ap->gpu_query_pending[1] = false;
+  if (ap->gpu_query_initialized) {
+    glGenQueries(2, ap->gpu_queries);
+  }
 
   // Allocate GPU-side version tracking for SoA chunk upload
   // Default chunk_size 256 → chunk_count = ceil(max_elements / 256)
@@ -781,6 +829,15 @@ void stygian_ap_destroy(StygianAP *ap) {
     glDeleteBuffers(1, &ap->soa_ssbo_appearance);
   if (ap->soa_ssbo_effects)
     glDeleteBuffers(1, &ap->soa_ssbo_effects);
+  if (ap->gpu_query_initialized) {
+    glDeleteQueries(2, ap->gpu_queries);
+    ap->gpu_queries[0] = 0u;
+    ap->gpu_queries[1] = 0u;
+    ap->gpu_query_initialized = false;
+    ap->gpu_query_in_flight = false;
+    ap->gpu_query_pending[0] = false;
+    ap->gpu_query_pending[1] = false;
+  }
   if (ap->vbo)
     glDeleteBuffers(1, &ap->vbo);
   if (ap->program)
@@ -820,6 +877,50 @@ uint32_t stygian_ap_get_last_upload_ranges(const StygianAP *ap) {
   if (!ap)
     return 0u;
   return ap->last_upload_ranges;
+}
+
+float stygian_ap_get_last_gpu_ms(const StygianAP *ap) {
+  if (!ap)
+    return 0.0f;
+  return ap->last_gpu_ms;
+}
+
+void stygian_ap_gpu_timer_begin(StygianAP *ap) {
+  if (!ap || !ap->gpu_query_initialized)
+    return;
+  if (ap->gpu_query_in_flight)
+    return;
+  glBeginQuery(GL_TIME_ELAPSED, ap->gpu_queries[ap->gpu_query_index]);
+  ap->gpu_query_in_flight = true;
+  ap->gpu_query_pending[ap->gpu_query_index] = true;
+}
+
+void stygian_ap_gpu_timer_end(StygianAP *ap) {
+  uint8_t poll_index;
+  GLint available = 0;
+  uint64_t ns = 0;
+  if (!ap || !ap->gpu_query_initialized)
+    return;
+  if (!ap->gpu_query_in_flight)
+    return;
+  glEndQuery(GL_TIME_ELAPSED);
+  ap->gpu_query_in_flight = false;
+
+  // Rotate and poll the previous-frame query to avoid stalling on the query
+  // we just ended.
+  ap->gpu_query_index = (uint8_t)((ap->gpu_query_index + 1u) & 1u);
+  poll_index = ap->gpu_query_index;
+
+  if (!ap->gpu_query_pending[poll_index])
+    return;
+
+  glGetQueryObjectiv(ap->gpu_queries[poll_index], GL_QUERY_RESULT_AVAILABLE,
+                     &available);
+  if (available) {
+    glGetQueryObjectui64v(ap->gpu_queries[poll_index], GL_QUERY_RESULT, &ns);
+    ap->last_gpu_ms = (float)((double)ns / 1000000.0);
+    ap->gpu_query_pending[poll_index] = false;
+  }
 }
 
 // ============================================================================

@@ -2,6 +2,7 @@
 // MIT License
 #include "../backends/stygian_ap.h"
 #include "../include/stygian_memory.h"
+#include "../include/stygian_error.h"
 #include "../window/stygian_window.h"
 #include "stygian_color.h"
 #include "stygian_icc.h"
@@ -19,11 +20,17 @@
 #include "stygian_platform.h"
 
 #include <assert.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 // Debug-only: trap CRT heap usage during frame processing
 #ifndef NDEBUG
 int g_stygian_debug_in_frame = 0;
 #endif
+
+static StygianContextErrorCallback g_default_context_error_callback = NULL;
+static void *g_default_context_error_callback_user_data = NULL;
 
 static uint32_t stygian_profile_to_flags(StygianGlyphProfile profile) {
   switch (profile) {
@@ -252,6 +259,301 @@ static uint32_t stygian_hash_u32(uint32_t v) {
   v *= 0x846ca68bu;
   v ^= v >> 16;
   return v;
+}
+
+static uint32_t stygian_hash_cstr(const char *str) {
+  uint32_t hash = 2166136261u;
+  const unsigned char *p = (const unsigned char *)str;
+  if (!p)
+    return 0u;
+  while (*p) {
+    hash ^= (uint32_t)(*p++);
+    hash *= 16777619u;
+  }
+  return hash;
+}
+
+static uint32_t stygian_thread_id_u32(void) {
+#ifdef _WIN32
+  return (uint32_t)GetCurrentThreadId();
+#else
+  return stygian_hash_u32((uint32_t)(uintptr_t)&g_stygian_debug_in_frame);
+#endif
+}
+
+static uint32_t stygian_current_source_tag(const StygianContext *ctx) {
+  const char *source = stygian_get_repaint_source(ctx);
+  if (!source || source[0] == '\0')
+    return 0u;
+  return stygian_hash_cstr(source);
+}
+
+static void stygian_context_log_error(StygianContext *ctx, uint32_t code,
+                                      StygianScopeId scope_id,
+                                      uint32_t source_tag,
+                                      const char *message) {
+  StygianContextErrorRecord record;
+  uint32_t slot;
+  const char *msg = message ? message : "";
+  if (!ctx)
+    return;
+
+  memset(&record, 0, sizeof(record));
+  record.timestamp_ms = stygian_now_ms();
+  record.frame_index = ctx->frame_index;
+  record.thread_id = stygian_thread_id_u32();
+  record.code = code;
+  record.scope_id = scope_id;
+  record.source_tag = source_tag;
+  record.message_hash = stygian_hash_cstr(msg);
+  stygian_cpystr(record.message, sizeof(record.message), msg);
+
+  slot = ctx->error_ring_head;
+  ctx->error_ring[slot] = record;
+  ctx->error_ring_head = (slot + 1u) % STYGIAN_ERROR_RING_CAPACITY;
+  if (ctx->error_ring_count < STYGIAN_ERROR_RING_CAPACITY) {
+    ctx->error_ring_count++;
+  } else {
+    ctx->error_ring_dropped++;
+  }
+
+  if (ctx->error_callback) {
+    ctx->error_callback(ctx, code, msg, ctx->error_callback_user_data);
+  } else if (g_default_context_error_callback) {
+    g_default_context_error_callback(ctx, code, msg,
+                                     g_default_context_error_callback_user_data);
+  }
+}
+
+static void stygian_scope_dirty_reason(StygianContext *ctx, StygianScopeId id,
+                                       bool next_frame, uint32_t reason,
+                                       uint32_t source_tag) {
+  int32_t idx;
+  if (!ctx || id == 0u)
+    return;
+  idx = stygian_scope_ensure_index(ctx, id);
+  if (idx < 0)
+    return;
+  if (next_frame)
+    ctx->scope_cache[idx].dirty_next = true;
+  else {
+    ctx->scope_cache[idx].dirty = true;
+    ctx->scope_cache[idx].dirty_next = false;
+  }
+  ctx->scope_cache[idx].generation++;
+  ctx->scope_cache[idx].last_dirty_reason = reason;
+  ctx->scope_cache[idx].last_source_tag = source_tag;
+  ctx->scope_cache[idx].last_frame_index = ctx->frame_index;
+}
+
+static int stygian_cmd_compare(const void *lhs, const void *rhs) {
+  const StygianCmdRecord *a = (const StygianCmdRecord *)lhs;
+  const StygianCmdRecord *b = (const StygianCmdRecord *)rhs;
+  if (a->scope_id < b->scope_id)
+    return -1;
+  if (a->scope_id > b->scope_id)
+    return 1;
+  if (a->element_id < b->element_id)
+    return -1;
+  if (a->element_id > b->element_id)
+    return 1;
+  if (a->property_id < b->property_id)
+    return -1;
+  if (a->property_id > b->property_id)
+    return 1;
+  if (a->op_priority < b->op_priority)
+    return -1;
+  if (a->op_priority > b->op_priority)
+    return 1;
+  if (a->submit_seq < b->submit_seq)
+    return -1;
+  if (a->submit_seq > b->submit_seq)
+    return 1;
+  if (a->cmd_index < b->cmd_index)
+    return -1;
+  if (a->cmd_index > b->cmd_index)
+    return 1;
+  return 0;
+}
+
+static void stygian_record_winner(StygianContext *ctx,
+                                  const StygianCmdRecord *record) {
+  uint32_t slot;
+  if (!ctx || !record)
+    return;
+  slot = ctx->winner_ring_head % STYGIAN_WINNER_RING_CAPACITY;
+  ctx->winner_ring[slot].scope_id = record->scope_id;
+  ctx->winner_ring[slot].winner_submit_seq = record->submit_seq;
+  ctx->winner_ring[slot].frame_index = ctx->frame_index;
+  ctx->winner_ring[slot].element_id = record->element_id;
+  ctx->winner_ring[slot].property_id = record->property_id;
+  ctx->winner_ring[slot].winner_source_tag = record->source_tag;
+  ctx->winner_ring[slot].winner_cmd_index = record->cmd_index;
+  ctx->winner_ring_head = (slot + 1u) % STYGIAN_WINNER_RING_CAPACITY;
+}
+
+static int32_t stygian_cmd_find_queue(StygianContext *ctx, uint32_t thread_id,
+                                      bool create_if_missing) {
+  uint32_t i;
+  if (!ctx)
+    return -1;
+  for (i = 0u; i < ctx->cmd_queue_count; i++) {
+    if (ctx->cmd_queues[i].owner_thread_id == thread_id)
+      return (int32_t)i;
+  }
+  if (!create_if_missing || ctx->cmd_queue_count >= STYGIAN_CMD_MAX_PRODUCERS)
+    return -1;
+  i = ctx->cmd_queue_count++;
+  ctx->cmd_queues[i].owner_thread_id = thread_id;
+  ctx->cmd_queues[i].registered_order = i;
+  ctx->cmd_buffers[i].ctx = ctx;
+  ctx->cmd_buffers[i].queue_index = i;
+  ctx->cmd_buffers[i].active = false;
+  return (int32_t)i;
+}
+
+static bool stygian_cmd_apply_one(StygianContext *ctx,
+                                  const StygianCmdRecord *record) {
+  StygianElement element;
+  if (!ctx || !record)
+    return false;
+  if (record->element_id == UINT32_MAX)
+    return false;
+  element = (StygianElement)(record->element_id + 1u);
+
+  switch (record->property_id) {
+  case STYGIAN_CMD_PROP_BOUNDS:
+    stygian_set_bounds(ctx, element, record->payload.bounds.x,
+                       record->payload.bounds.y, record->payload.bounds.w,
+                       record->payload.bounds.h);
+    break;
+  case STYGIAN_CMD_PROP_COLOR:
+    stygian_set_color(ctx, element, record->payload.color.r,
+                      record->payload.color.g, record->payload.color.b,
+                      record->payload.color.a);
+    break;
+  case STYGIAN_CMD_PROP_BORDER:
+    stygian_set_border(ctx, element, record->payload.color.r,
+                       record->payload.color.g, record->payload.color.b,
+                       record->payload.color.a);
+    break;
+  case STYGIAN_CMD_PROP_RADIUS:
+    stygian_set_radius(ctx, element, record->payload.radius.tl,
+                       record->payload.radius.tr, record->payload.radius.br,
+                       record->payload.radius.bl);
+    break;
+  case STYGIAN_CMD_PROP_TYPE:
+    stygian_set_type(ctx, element, (StygianType)record->payload.type.type);
+    break;
+  case STYGIAN_CMD_PROP_VISIBLE:
+    stygian_set_visible(ctx, element, record->payload.visible.visible != 0u);
+    break;
+  case STYGIAN_CMD_PROP_Z:
+    stygian_set_z(ctx, element, record->payload.depth.z);
+    break;
+  case STYGIAN_CMD_PROP_TEXTURE:
+    stygian_set_texture(ctx, element, (StygianTexture)record->payload.texture.texture,
+                        record->payload.texture.u0, record->payload.texture.v0,
+                        record->payload.texture.u1, record->payload.texture.v1);
+    break;
+  case STYGIAN_CMD_PROP_SHADOW:
+    stygian_set_shadow(ctx, element, record->payload.shadow.offset_x,
+                       record->payload.shadow.offset_y, record->payload.shadow.blur,
+                       record->payload.shadow.spread, record->payload.shadow.r,
+                       record->payload.shadow.g, record->payload.shadow.b,
+                       record->payload.shadow.a);
+    break;
+  case STYGIAN_CMD_PROP_GRADIENT:
+    stygian_set_gradient(ctx, element, record->payload.gradient.angle,
+                         record->payload.gradient.r1, record->payload.gradient.g1,
+                         record->payload.gradient.b1, record->payload.gradient.a1,
+                         record->payload.gradient.r2, record->payload.gradient.g2,
+                         record->payload.gradient.b2, record->payload.gradient.a2);
+    break;
+  case STYGIAN_CMD_PROP_HOVER:
+    stygian_set_hover(ctx, element, record->payload.scalar.value);
+    break;
+  case STYGIAN_CMD_PROP_BLEND:
+    stygian_set_blend(ctx, element, record->payload.scalar.value);
+    break;
+  case STYGIAN_CMD_PROP_BLUR:
+    stygian_set_blur(ctx, element, record->payload.scalar.value);
+    break;
+  case STYGIAN_CMD_PROP_GLOW:
+    stygian_set_glow(ctx, element, record->payload.scalar.value);
+    break;
+  default:
+    return false;
+  }
+
+  if (record->scope_id != 0u) {
+    stygian_scope_dirty_reason(ctx, record->scope_id, false,
+                               STYGIAN_REPAINT_REASON_EVENT_MUTATION,
+                               record->source_tag);
+  }
+  stygian_record_winner(ctx, record);
+  return true;
+}
+
+static uint32_t stygian_commit_pending_commands(StygianContext *ctx) {
+  uint32_t frozen_epoch;
+  uint32_t merge_count = 0u;
+  uint32_t applied = 0u;
+  uint32_t i, j;
+  if (!ctx || !ctx->cmd_merge_records || ctx->cmd_merge_capacity == 0u)
+    return 0u;
+
+  frozen_epoch = ctx->cmd_publish_epoch;
+  ctx->cmd_committing = true;
+  ctx->cmd_publish_epoch = frozen_epoch ^ 1u;
+
+  for (i = 0u; i < ctx->cmd_queue_count; i++) {
+    StygianCmdQueueEpoch *slot = &ctx->cmd_queues[i].epoch[frozen_epoch];
+    if (slot->dropped > 0u) {
+      ctx->total_command_drops += slot->dropped;
+      stygian_context_log_error(ctx, STYGIAN_ERROR_COMMAND_BUFFER_FULL, 0u, 0u,
+                                "stygian command queue overflow");
+      slot->dropped = 0u;
+    }
+    if (slot->count == 0u)
+      continue;
+    if (merge_count + slot->count > ctx->cmd_merge_capacity) {
+      uint32_t room = ctx->cmd_merge_capacity - merge_count;
+      for (j = 0u; j < room; j++) {
+        ctx->cmd_merge_records[merge_count + j] = slot->records[j];
+      }
+      ctx->total_command_drops += (slot->count - room);
+      stygian_context_log_error(ctx, STYGIAN_ERROR_COMMAND_BUFFER_FULL, 0u, 0u,
+                                "stygian command merge overflow");
+      merge_count = ctx->cmd_merge_capacity;
+      slot->count = 0u;
+      break;
+    }
+    for (j = 0u; j < slot->count; j++) {
+      ctx->cmd_merge_records[merge_count + j] = slot->records[j];
+    }
+    merge_count += slot->count;
+    slot->count = 0u;
+  }
+
+  if (merge_count > 1u) {
+    qsort(ctx->cmd_merge_records, merge_count, sizeof(StygianCmdRecord),
+          stygian_cmd_compare);
+  }
+
+  for (i = 0u; i < merge_count; i++) {
+    if (stygian_cmd_apply_one(ctx, &ctx->cmd_merge_records[i]))
+      applied++;
+  }
+
+  ctx->cmd_committing = false;
+  ctx->last_commit_applied = applied;
+  if (applied > 0u) {
+    stygian_mark_repaint_reason(ctx, STYGIAN_REPAINT_REASON_EVENT_MUTATION);
+    stygian_set_repaint_source(ctx, "mutation-commit");
+    stygian_request_repaint_after_ms(ctx, 0u);
+  }
+  return applied;
 }
 
 static uint32_t stygian_next_pow2_u32(uint32_t v) {
@@ -882,26 +1184,27 @@ void stygian_scope_invalidate(StygianContext *ctx, StygianScopeId id) {
 }
 
 void stygian_scope_invalidate_now(StygianContext *ctx, StygianScopeId id) {
-  int32_t idx;
+  uint32_t reason;
+  uint32_t source_tag;
   if (!ctx || id == 0u)
     return;
-  idx = stygian_scope_ensure_index(ctx, id);
-  if (idx < 0)
-    return;
-  ctx->scope_cache[idx].dirty = true;
-  ctx->scope_cache[idx].dirty_next = false;
-  ctx->scope_cache[idx].generation++;
+  reason = ctx->repaint.reason_flags;
+  if (reason == STYGIAN_REPAINT_REASON_NONE)
+    reason = STYGIAN_REPAINT_REASON_EVENT_MUTATION;
+  source_tag = stygian_current_source_tag(ctx);
+  stygian_scope_dirty_reason(ctx, id, false, reason, source_tag);
 }
 
 void stygian_scope_invalidate_next(StygianContext *ctx, StygianScopeId id) {
-  int32_t idx;
+  uint32_t reason;
+  uint32_t source_tag;
   if (!ctx || id == 0u)
     return;
-  idx = stygian_scope_ensure_index(ctx, id);
-  if (idx < 0)
-    return;
-  ctx->scope_cache[idx].dirty_next = true;
-  ctx->scope_cache[idx].generation++;
+  reason = ctx->repaint.reason_flags;
+  if (reason == STYGIAN_REPAINT_REASON_NONE)
+    reason = STYGIAN_REPAINT_REASON_EVENT_MUTATION;
+  source_tag = stygian_current_source_tag(ctx);
+  stygian_scope_dirty_reason(ctx, id, true, reason, source_tag);
 }
 
 bool stygian_scope_is_dirty(StygianContext *ctx, StygianScopeId id) {
@@ -937,12 +1240,18 @@ void stygian_request_overlay_hz(StygianContext *ctx, uint32_t hz) {
 }
 
 void stygian_invalidate_overlay_scopes(StygianContext *ctx) {
+  uint32_t source_tag;
   if (!ctx)
     return;
+  source_tag = stygian_current_source_tag(ctx);
   // Only mark overlay scopes as dirty, preserve base UI scopes
   for (uint32_t i = 0; i < ctx->scope_count; i++) {
     if (STYGIAN_IS_OVERLAY_SCOPE(ctx->scope_cache[i].id)) {
       ctx->scope_cache[i].dirty_next = true;
+      ctx->scope_cache[i].generation++;
+      ctx->scope_cache[i].last_dirty_reason = STYGIAN_REPAINT_REASON_TIMER;
+      ctx->scope_cache[i].last_source_tag = source_tag;
+      ctx->scope_cache[i].last_frame_index = ctx->frame_index;
     }
   }
 }
@@ -989,6 +1298,24 @@ StygianContext *stygian_create(const StygianConfig *config) {
   ctx->last_frame_scope_replay_hits = 0u;
   ctx->last_frame_scope_replay_misses = 0u;
   ctx->last_frame_scope_forced_rebuilds = 0u;
+  ctx->last_frame_reason_flags = STYGIAN_REPAINT_REASON_NONE;
+  ctx->last_frame_eval_only = 0u;
+  ctx->eval_only_frame = false;
+  ctx->frame_intent = STYGIAN_FRAME_RENDER;
+  ctx->cmd_queue_count = 0u;
+  ctx->cmd_publish_epoch = 0u;
+  ctx->cmd_submit_seq_next = 0u;
+  ctx->cmd_committing = false;
+  ctx->last_commit_applied = 0u;
+  ctx->total_command_drops = 0u;
+  ctx->cmd_merge_records = NULL;
+  ctx->cmd_merge_capacity = 0u;
+  ctx->winner_ring_head = 0u;
+  ctx->error_callback = g_default_context_error_callback;
+  ctx->error_callback_user_data = g_default_context_error_callback_user_data;
+  ctx->error_ring_head = 0u;
+  ctx->error_ring_count = 0u;
+  ctx->error_ring_dropped = 0u;
 
   // Create per-frame scratch arena (4MB default)
   ctx->frame_arena = stygian_arena_create(4 * 1024 * 1024);
@@ -1045,6 +1372,32 @@ StygianContext *stygian_create(const StygianConfig *config) {
       ctx->chunks[ci].hot_dirty_min = UINT32_MAX;
       ctx->chunks[ci].appearance_dirty_min = UINT32_MAX;
       ctx->chunks[ci].effects_dirty_min = UINT32_MAX;
+    }
+
+    for (uint32_t qi = 0u; qi < STYGIAN_CMD_MAX_PRODUCERS; qi++) {
+      for (uint32_t epoch = 0u; epoch < 2u; epoch++) {
+        ctx->cmd_queues[qi].epoch[epoch].records =
+            (StygianCmdRecord *)stygian_alloc_array(
+                allocator, STYGIAN_CMD_QUEUE_CAPACITY,
+                sizeof(StygianCmdRecord), _Alignof(StygianCmdRecord), true);
+        if (!ctx->cmd_queues[qi].epoch[epoch].records) {
+          stygian_destroy(ctx);
+          return NULL;
+        }
+      }
+      ctx->cmd_buffers[qi].ctx = ctx;
+      ctx->cmd_buffers[qi].queue_index = qi;
+      ctx->cmd_buffers[qi].active = false;
+    }
+
+    ctx->cmd_merge_capacity = STYGIAN_CMD_MAX_PRODUCERS *
+                              STYGIAN_CMD_QUEUE_CAPACITY;
+    ctx->cmd_merge_records = (StygianCmdRecord *)stygian_alloc_array(
+        allocator, ctx->cmd_merge_capacity, sizeof(StygianCmdRecord),
+        _Alignof(StygianCmdRecord), true);
+    if (!ctx->cmd_merge_records) {
+      stygian_destroy(ctx);
+      return NULL;
     }
   }
 
@@ -1172,6 +1525,16 @@ void stygian_destroy(StygianContext *ctx) {
   // Note: Window is NOT destroyed here - it's owned externally
 
   // ctx->elements removed (AoS elimination)
+  for (uint32_t qi = 0u; qi < STYGIAN_CMD_MAX_PRODUCERS; qi++) {
+    for (uint32_t epoch = 0u; epoch < 2u; epoch++) {
+      stygian_free_raw(allocator, ctx->cmd_queues[qi].epoch[epoch].records);
+      ctx->cmd_queues[qi].epoch[epoch].records = NULL;
+      ctx->cmd_queues[qi].epoch[epoch].count = 0u;
+      ctx->cmd_queues[qi].epoch[epoch].dropped = 0u;
+    }
+  }
+  stygian_free_raw(allocator, ctx->cmd_merge_records);
+  ctx->cmd_merge_records = NULL;
   stygian_free_raw(allocator, ctx->free_list);
   stygian_free_raw(allocator, ctx->soa.hot);
   stygian_free_raw(allocator, ctx->soa.appearance);
@@ -1194,7 +1557,8 @@ StygianAP *stygian_get_ap(StygianContext *ctx) { return ctx ? ctx->ap : NULL; }
 // Frame Management
 // ============================================================================
 
-void stygian_begin_frame(StygianContext *ctx, int width, int height) {
+void stygian_begin_frame_intent(StygianContext *ctx, int width, int height,
+                                StygianFrameIntent intent) {
   if (!ctx)
     return;
 
@@ -1205,12 +1569,16 @@ void stygian_begin_frame(StygianContext *ctx, int width, int height) {
   }
 #endif
 
+  ctx->frame_intent = intent;
+  ctx->eval_only_frame = (intent == STYGIAN_FRAME_EVAL_ONLY);
+
   // Reset per-frame scratch arena
   if (ctx->frame_arena) {
     stygian_arena_reset(ctx->frame_arena);
   }
 
   stygian_repaint_begin_frame(ctx);
+  stygian_commit_pending_commands(ctx);
 
   ctx->width = width;
   ctx->height = height;
@@ -1218,6 +1586,7 @@ void stygian_begin_frame(StygianContext *ctx, int width, int height) {
   // DDI: Check if any scopes are dirty.
   bool has_dirty_overlay_scopes = false;
   bool has_dirty_non_overlay_scopes = false;
+  bool repaint_due = false;
   uint32_t overlay_trim_start = ctx->element_count;
   for (uint32_t i = 0; i < ctx->scope_count; i++) {
     if (ctx->scope_cache[i].dirty || ctx->scope_cache[i].dirty_next) {
@@ -1231,6 +1600,7 @@ void stygian_begin_frame(StygianContext *ctx, int width, int height) {
       }
     }
   }
+  repaint_due = stygian_has_pending_repaint(ctx);
 
   // DDI: Full reset when immediate mode is active or any scope is dirty.
   if (ctx->scope_count == 0 || has_dirty_non_overlay_scopes) {
@@ -1244,47 +1614,35 @@ void stygian_begin_frame(StygianContext *ctx, int width, int height) {
       ctx->free_list[i] = ctx->config.max_elements - 1 - i;
     }
     ctx->free_count = ctx->config.max_elements;
-    ctx->skip_frame = false; // Need to render this frame
+    ctx->skip_frame = false;
   } else if (has_dirty_overlay_scopes) {
-    bool can_trim = (overlay_trim_start <= ctx->element_count);
-    if (can_trim) {
-      for (uint32_t i = 0; i < ctx->scope_count; i++) {
-        const StygianScopeCacheEntry *entry = &ctx->scope_cache[i];
-        if (entry->range_count == 0u)
-          continue;
-        if (!STYGIAN_IS_OVERLAY_SCOPE(entry->id) &&
-            entry->range_start >= overlay_trim_start) {
-          can_trim = false;
-          break;
-        }
-      }
+    // Overlay-only dirty frame: start replay from slot 0 so clean non-overlay
+    // scopes can replay in-order. Starting at overlay_trim_start breaks replay
+    // invariants and forces expensive rebuilds.
+    (void)overlay_trim_start;
+    ctx->element_count = 0;
+    ctx->transient_start = 0;
+    ctx->transient_count = 0;
+    for (uint32_t i = 0; i < ctx->config.max_elements; i++) {
+      ctx->free_list[i] = ctx->config.max_elements - 1 - i;
     }
-    if (!can_trim) {
-      ctx->element_count = 0;
-      ctx->transient_start = 0;
-      ctx->transient_count = 0;
-      for (uint32_t i = 0; i < ctx->config.max_elements; i++) {
-        ctx->free_list[i] = ctx->config.max_elements - 1 - i;
-      }
-      ctx->free_count = ctx->config.max_elements;
-    } else {
-      uint32_t max_elements = ctx->config.max_elements;
-      ctx->element_count = overlay_trim_start;
-      ctx->transient_start = overlay_trim_start;
-      ctx->transient_count = 0;
-      if (overlay_trim_start <= max_elements) {
-        ctx->free_count = max_elements - overlay_trim_start;
-      } else {
-        ctx->free_count = 0u;
-      }
-      for (uint32_t i = 0; i < ctx->free_count; i++) {
-        ctx->free_list[i] = max_elements - 1u - i;
-      }
+    ctx->free_count = ctx->config.max_elements;
+    ctx->skip_frame = false;
+  } else if (repaint_due) {
+    // All scopes are currently clean, but a repaint is due (timer/deferred/
+    // request-only evaluation). Rebuild free-list cursor so clean scopes can
+    // replay deterministically from slot 0 without forcing invalidation.
+    ctx->element_count = 0;
+    ctx->transient_start = 0;
+    ctx->transient_count = 0;
+    for (uint32_t i = 0; i < ctx->config.max_elements; i++) {
+      ctx->free_list[i] = ctx->config.max_elements - 1 - i;
     }
-    ctx->skip_frame = false; // Need to render this frame
+    ctx->free_count = ctx->config.max_elements;
+    ctx->skip_frame = false;
   } else {
     // DDI: All scopes clean - preserve element data, skip submit/swap
-    ctx->skip_frame = true; // Signal end_frame to skip rendering
+    ctx->skip_frame = true;
     // Element data preserved, free list preserved, scopes will replay
   }
 
@@ -1310,8 +1668,15 @@ void stygian_begin_frame(StygianContext *ctx, int width, int height) {
   ctx->frame_scope_replay_misses = 0u;
   ctx->frame_scope_forced_rebuilds = 0u;
 
-  // Begin frame on AP
-  stygian_ap_begin_frame(ctx->ap, width, height);
+  // Eval-only frames run all bookkeeping/state paths but never touch AP submit.
+  // Render intent only begins AP frame when there is actual GPU work to do.
+  if (!ctx->skip_frame && !ctx->eval_only_frame) {
+    stygian_ap_begin_frame(ctx->ap, width, height);
+  }
+}
+
+void stygian_begin_frame(StygianContext *ctx, int width, int height) {
+  stygian_begin_frame_intent(ctx, width, height, STYGIAN_FRAME_RENDER);
 }
 
 void stygian_set_glyph_feature_flags(StygianContext *ctx, uint32_t flags) {
@@ -1522,8 +1887,8 @@ void stygian_end_frame(StygianContext *ctx) {
 
   t_build_end = stygian_now_ms();
 
-  // DDI: Skip submit/draw/swap if all scopes are clean
-  if (ctx->skip_frame) {
+  // DDI: Eval-only or clean-scope frames skip submit/draw/swap.
+  if (ctx->skip_frame || ctx->eval_only_frame) {
     // No-op frame - all scopes clean, preserve GPU state
     ctx->frames_skipped++;
     ctx->last_frame_element_count = ctx->element_count;
@@ -1537,12 +1902,28 @@ void stygian_end_frame(StygianContext *ctx) {
     ctx->last_frame_build_ms = (float)(t_build_end - ctx->frame_begin_cpu_ms);
     ctx->last_frame_submit_ms = 0.0f;
     ctx->last_frame_present_ms = 0.0f;
+    ctx->last_frame_gpu_ms = 0.0f;
+    ctx->last_frame_reason_flags = ctx->repaint.reason_flags;
+    ctx->last_frame_eval_only = ctx->eval_only_frame ? 1u : 0u;
     ctx->frame_index++;
     stygian_repaint_end_frame(ctx);
-    ctx->stats_frames_skipped++;
+    if (ctx->eval_only_frame)
+      ctx->stats_frames_eval_only++;
+    else
+      ctx->stats_frames_skipped++;
+    if (ctx->last_frame_reason_flags & STYGIAN_REPAINT_REASON_EVENT_MUTATION)
+      ctx->stats_reason_mutation++;
+    if (ctx->last_frame_reason_flags &
+        (STYGIAN_REPAINT_REASON_TIMER | STYGIAN_REPAINT_REASON_ANIMATION))
+      ctx->stats_reason_timer++;
+    if (ctx->last_frame_reason_flags & STYGIAN_REPAINT_REASON_ASYNC)
+      ctx->stats_reason_async++;
+    if (ctx->last_frame_reason_flags & STYGIAN_REPAINT_REASON_FORCED)
+      ctx->stats_reason_forced++;
     return;
   }
 
+  stygian_ap_gpu_timer_begin(ctx->ap);
   stygian_ap_set_clips(ctx->ap, (const float *)ctx->clips, ctx->clip_count);
   stygian_ap_submit(ctx->ap, ctx->soa.hot, ctx->element_count);
   stygian_ap_submit_soa(ctx->ap, ctx->soa.hot, ctx->soa.appearance,
@@ -1581,17 +1962,21 @@ void stygian_end_frame(StygianContext *ctx) {
     }
   }
   t_submit_end = stygian_now_ms();
+  stygian_ap_gpu_timer_end(ctx->ap);
 
   ctx->last_frame_element_count = ctx->element_count;
   ctx->last_frame_clip_count = ctx->clip_count;
   ctx->last_frame_draw_calls = ctx->frame_draw_calls;
   ctx->last_frame_upload_bytes = stygian_ap_get_last_upload_bytes(ctx->ap);
   ctx->last_frame_upload_ranges = stygian_ap_get_last_upload_ranges(ctx->ap);
+  ctx->last_frame_gpu_ms = stygian_ap_get_last_gpu_ms(ctx->ap);
   ctx->last_frame_scope_replay_hits = ctx->frame_scope_replay_hits;
   ctx->last_frame_scope_replay_misses = ctx->frame_scope_replay_misses;
   ctx->last_frame_scope_forced_rebuilds = ctx->frame_scope_forced_rebuilds;
   ctx->last_frame_build_ms = (float)(t_build_end - ctx->frame_begin_cpu_ms);
   ctx->last_frame_submit_ms = (float)(t_submit_end - t_build_end);
+  ctx->last_frame_reason_flags = ctx->repaint.reason_flags;
+  ctx->last_frame_eval_only = 0u;
   ctx->frame_index++;
 
   // End frame (finalize)
@@ -1613,6 +1998,15 @@ void stygian_end_frame(StygianContext *ctx) {
   ctx->stats_total_build_ms += ctx->last_frame_build_ms;
   ctx->stats_total_submit_ms += ctx->last_frame_submit_ms;
   ctx->stats_total_present_ms += ctx->last_frame_present_ms;
+  if (ctx->last_frame_reason_flags & STYGIAN_REPAINT_REASON_EVENT_MUTATION)
+    ctx->stats_reason_mutation++;
+  if (ctx->last_frame_reason_flags &
+      (STYGIAN_REPAINT_REASON_TIMER | STYGIAN_REPAINT_REASON_ANIMATION))
+    ctx->stats_reason_timer++;
+  if (ctx->last_frame_reason_flags & STYGIAN_REPAINT_REASON_ASYNC)
+    ctx->stats_reason_async++;
+  if (ctx->last_frame_reason_flags & STYGIAN_REPAINT_REASON_FORCED)
+    ctx->stats_reason_forced++;
 
   // Periodic stats log
   if (ctx->stats_log_interval_ms > 0u) {
@@ -1635,9 +2029,21 @@ void stygian_end_frame(StygianContext *ctx) {
              (unsigned long long)(ctx->stats_total_upload_bytes / 1024ull),
              hit_pct, ctx->stats_frames_skipped,
              ctx->stats_scope_forced_rebuilds);
+      printf("STYGIAN_METRIC sample_ms=%llu render=%u eval=%u skipped=%u "
+             "reason_mut=%u reason_timer=%u reason_async=%u reason_forced=%u "
+             "upload_bytes=%llu replay_hit=%u replay_miss=%u cmd_applied=%u "
+             "cmd_drops=%u\n",
+             (unsigned long long)elapsed, ctx->stats_frames_rendered,
+             ctx->stats_frames_eval_only, ctx->stats_frames_skipped,
+             ctx->stats_reason_mutation, ctx->stats_reason_timer,
+             ctx->stats_reason_async, ctx->stats_reason_forced,
+             (unsigned long long)ctx->stats_total_upload_bytes,
+             ctx->stats_scope_replay_hits, ctx->stats_scope_replay_misses,
+             ctx->last_commit_applied, ctx->total_command_drops);
       // Reset accumulators
       ctx->stats_frames_rendered = 0u;
       ctx->stats_frames_skipped = 0u;
+      ctx->stats_frames_eval_only = 0u;
       ctx->stats_total_upload_bytes = 0ull;
       ctx->stats_scope_replay_hits = 0u;
       ctx->stats_scope_replay_misses = 0u;
@@ -1645,6 +2051,10 @@ void stygian_end_frame(StygianContext *ctx) {
       ctx->stats_total_build_ms = 0.f;
       ctx->stats_total_submit_ms = 0.f;
       ctx->stats_total_present_ms = 0.f;
+      ctx->stats_reason_mutation = 0u;
+      ctx->stats_reason_timer = 0u;
+      ctx->stats_reason_async = 0u;
+      ctx->stats_reason_forced = 0u;
       ctx->stats_last_log_ms = now_ms;
     }
   }
@@ -1699,6 +2109,22 @@ float stygian_get_last_frame_present_ms(const StygianContext *ctx) {
   return ctx ? ctx->last_frame_present_ms : 0.0f;
 }
 
+float stygian_get_last_frame_gpu_ms(const StygianContext *ctx) {
+  return ctx ? ctx->last_frame_gpu_ms : 0.0f;
+}
+
+uint32_t stygian_get_last_frame_reason_flags(const StygianContext *ctx) {
+  return ctx ? ctx->last_frame_reason_flags : STYGIAN_REPAINT_REASON_NONE;
+}
+
+uint32_t stygian_get_last_frame_eval_only(const StygianContext *ctx) {
+  return ctx ? ctx->last_frame_eval_only : 0u;
+}
+
+bool stygian_is_eval_only_frame(const StygianContext *ctx) {
+  return ctx ? ctx->eval_only_frame : false;
+}
+
 uint32_t stygian_get_frames_skipped(const StygianContext *ctx) {
   return ctx ? ctx->frames_skipped : 0u;
 }
@@ -1734,6 +2160,71 @@ uint32_t stygian_get_inline_emoji_cache_count(const StygianContext *ctx) {
 uint16_t stygian_get_clip_capacity(const StygianContext *ctx) {
   (void)ctx;
   return STYGIAN_MAX_CLIPS;
+}
+
+uint32_t stygian_get_last_commit_applied(const StygianContext *ctx) {
+  return ctx ? ctx->last_commit_applied : 0u;
+}
+
+uint32_t stygian_get_total_command_drops(const StygianContext *ctx) {
+  return ctx ? ctx->total_command_drops : 0u;
+}
+
+bool stygian_scope_get_last_dirty_info(const StygianContext *ctx,
+                                       StygianScopeId id, uint32_t *out_reason,
+                                       uint32_t *out_source_tag,
+                                       uint32_t *out_frame_index) {
+  int32_t idx;
+  if (!ctx || id == 0u)
+    return false;
+  idx = stygian_scope_find_index(ctx, id);
+  if (idx < 0)
+    return false;
+  if (out_reason)
+    *out_reason = ctx->scope_cache[idx].last_dirty_reason;
+  if (out_source_tag)
+    *out_source_tag = ctx->scope_cache[idx].last_source_tag;
+  if (out_frame_index)
+    *out_frame_index = ctx->scope_cache[idx].last_frame_index;
+  return true;
+}
+
+void stygian_context_set_error_callback(StygianContext *ctx,
+                                        StygianContextErrorCallback callback,
+                                        void *user_data) {
+  if (!ctx)
+    return;
+  ctx->error_callback = callback;
+  ctx->error_callback_user_data = user_data;
+}
+
+void stygian_set_default_context_error_callback(
+    StygianContextErrorCallback callback, void *user_data) {
+  g_default_context_error_callback = callback;
+  g_default_context_error_callback_user_data = user_data;
+}
+
+uint32_t stygian_context_get_recent_errors(const StygianContext *ctx,
+                                           StygianContextErrorRecord *out,
+                                           uint32_t max_count) {
+  uint32_t available;
+  uint32_t count;
+  uint32_t i;
+  if (!ctx || !out || max_count == 0u)
+    return 0u;
+  available = ctx->error_ring_count;
+  count = available < max_count ? available : max_count;
+  for (i = 0u; i < count; i++) {
+    uint32_t idx =
+        (ctx->error_ring_head + STYGIAN_ERROR_RING_CAPACITY - 1u - i) %
+        STYGIAN_ERROR_RING_CAPACITY;
+    out[i] = ctx->error_ring[idx];
+  }
+  return count;
+}
+
+uint32_t stygian_context_get_error_drop_count(const StygianContext *ctx) {
+  return ctx ? ctx->error_ring_dropped : 0u;
 }
 
 // ============================================================================
@@ -2109,6 +2600,306 @@ void stygian_set_glow(StygianContext *ctx, StygianElement e, float intensity) {
   // SoA write
   ctx->soa.effects[id].glow_intensity = intensity;
   stygian_mark_soa_effects_dirty(ctx, id);
+}
+
+static bool stygian_cmd_append_record(StygianCmdBuffer *buffer,
+                                      StygianCmdRecord *record) {
+  StygianContext *ctx;
+  StygianCmdProducerQueue *queue;
+  StygianCmdQueueEpoch *slot;
+  if (!buffer || !record || !buffer->active)
+    return false;
+  ctx = buffer->ctx;
+  if (!ctx)
+    return false;
+  if (ctx->cmd_committing) {
+    stygian_context_log_error(ctx, STYGIAN_ERROR_INVALID_STATE, 0u,
+                              buffer->source_tag,
+                              "submit attempted during commit");
+    return false;
+  }
+  if (buffer->queue_index >= ctx->cmd_queue_count)
+    return false;
+  if (buffer->epoch != ctx->cmd_publish_epoch) {
+    stygian_context_log_error(ctx, STYGIAN_ERROR_INVALID_STATE, 0u,
+                              buffer->source_tag,
+                              "submit attempted to frozen epoch");
+    return false;
+  }
+  queue = &ctx->cmd_queues[buffer->queue_index];
+  slot = &queue->epoch[buffer->epoch];
+  if (slot->count >= STYGIAN_CMD_QUEUE_CAPACITY) {
+    slot->dropped++;
+    ctx->total_command_drops++;
+    stygian_context_log_error(ctx, STYGIAN_ERROR_COMMAND_BUFFER_FULL, 0u,
+                              buffer->source_tag,
+                              "producer queue capacity reached");
+    return false;
+  }
+  record->scope_id = buffer->scope_id;
+  record->source_tag = buffer->source_tag;
+  record->submit_seq = 0u;
+  record->cmd_index = 0u;
+  slot->records[slot->count++] = *record;
+  buffer->count++;
+  return true;
+}
+
+StygianCmdBuffer *stygian_cmd_begin(StygianContext *ctx, uint32_t source_tag) {
+  uint32_t thread_id;
+  int32_t queue_index;
+  StygianCmdBuffer *buffer;
+  StygianCmdQueueEpoch *slot;
+  if (!ctx)
+    return NULL;
+  thread_id = stygian_thread_id_u32();
+  queue_index = stygian_cmd_find_queue(ctx, thread_id, true);
+  if (queue_index < 0) {
+    stygian_context_log_error(ctx, STYGIAN_ERROR_COMMAND_BUFFER_FULL, 0u,
+                              source_tag, "no command producer slot available");
+    return NULL;
+  }
+  buffer = &ctx->cmd_buffers[queue_index];
+  if (buffer->active) {
+    stygian_context_log_error(ctx, STYGIAN_ERROR_INVALID_STATE, 0u, source_tag,
+                              "nested command buffer begin on same thread");
+    return NULL;
+  }
+  buffer->ctx = ctx;
+  buffer->queue_index = (uint32_t)queue_index;
+  buffer->epoch = ctx->cmd_publish_epoch;
+  buffer->source_tag = source_tag;
+  buffer->scope_id = ctx->active_scope_index >= 0
+                         ? ctx->scope_cache[ctx->active_scope_index].id
+                         : 0u;
+  slot = &ctx->cmd_queues[queue_index].epoch[buffer->epoch];
+  buffer->begin_index = slot->count;
+  buffer->count = 0u;
+  buffer->active = true;
+  return buffer;
+}
+
+void stygian_cmd_discard(StygianCmdBuffer *buffer) {
+  StygianContext *ctx;
+  StygianCmdQueueEpoch *slot;
+  if (!buffer || !buffer->active)
+    return;
+  ctx = buffer->ctx;
+  if (!ctx || buffer->queue_index >= ctx->cmd_queue_count) {
+    buffer->active = false;
+    return;
+  }
+  slot = &ctx->cmd_queues[buffer->queue_index].epoch[buffer->epoch];
+  if (buffer->begin_index <= slot->count) {
+    slot->count = buffer->begin_index;
+  }
+  buffer->active = false;
+  buffer->count = 0u;
+}
+
+bool stygian_cmd_submit(StygianContext *ctx, StygianCmdBuffer *buffer) {
+  StygianCmdQueueEpoch *slot;
+  uint64_t submit_seq;
+  uint32_t i;
+  if (!ctx || !buffer || !buffer->active || buffer->ctx != ctx)
+    return false;
+  if (ctx->cmd_committing) {
+    stygian_context_log_error(ctx, STYGIAN_ERROR_INVALID_STATE, 0u,
+                              buffer->source_tag,
+                              "submit attempted while commit is active");
+    return false;
+  }
+  if (buffer->queue_index >= ctx->cmd_queue_count)
+    return false;
+  slot = &ctx->cmd_queues[buffer->queue_index].epoch[buffer->epoch];
+  if (buffer->begin_index > slot->count)
+    return false;
+  submit_seq = ++ctx->cmd_submit_seq_next;
+  for (i = 0u; i < buffer->count; i++) {
+    uint32_t idx = buffer->begin_index + i;
+    if (idx >= slot->count)
+      break;
+    slot->records[idx].submit_seq = submit_seq;
+    slot->records[idx].cmd_index = i;
+  }
+  buffer->active = false;
+  buffer->count = 0u;
+  return true;
+}
+
+bool stygian_cmd_set_bounds(StygianCmdBuffer *buffer, StygianElement element,
+                            float x, float y, float w, float h) {
+  StygianCmdRecord record;
+  memset(&record, 0, sizeof(record));
+  record.element_id = element ? (uint32_t)(element - 1u) : UINT32_MAX;
+  record.property_id = STYGIAN_CMD_PROP_BOUNDS;
+  record.payload.bounds.x = x;
+  record.payload.bounds.y = y;
+  record.payload.bounds.w = w;
+  record.payload.bounds.h = h;
+  return stygian_cmd_append_record(buffer, &record);
+}
+
+bool stygian_cmd_set_color(StygianCmdBuffer *buffer, StygianElement element,
+                           float r, float g, float b, float a) {
+  StygianCmdRecord record;
+  memset(&record, 0, sizeof(record));
+  record.element_id = element ? (uint32_t)(element - 1u) : UINT32_MAX;
+  record.property_id = STYGIAN_CMD_PROP_COLOR;
+  record.payload.color.r = r;
+  record.payload.color.g = g;
+  record.payload.color.b = b;
+  record.payload.color.a = a;
+  return stygian_cmd_append_record(buffer, &record);
+}
+
+bool stygian_cmd_set_border(StygianCmdBuffer *buffer, StygianElement element,
+                            float r, float g, float b, float a) {
+  StygianCmdRecord record;
+  memset(&record, 0, sizeof(record));
+  record.element_id = element ? (uint32_t)(element - 1u) : UINT32_MAX;
+  record.property_id = STYGIAN_CMD_PROP_BORDER;
+  record.payload.color.r = r;
+  record.payload.color.g = g;
+  record.payload.color.b = b;
+  record.payload.color.a = a;
+  return stygian_cmd_append_record(buffer, &record);
+}
+
+bool stygian_cmd_set_radius(StygianCmdBuffer *buffer, StygianElement element,
+                            float tl, float tr, float br, float bl) {
+  StygianCmdRecord record;
+  memset(&record, 0, sizeof(record));
+  record.element_id = element ? (uint32_t)(element - 1u) : UINT32_MAX;
+  record.property_id = STYGIAN_CMD_PROP_RADIUS;
+  record.payload.radius.tl = tl;
+  record.payload.radius.tr = tr;
+  record.payload.radius.br = br;
+  record.payload.radius.bl = bl;
+  return stygian_cmd_append_record(buffer, &record);
+}
+
+bool stygian_cmd_set_type(StygianCmdBuffer *buffer, StygianElement element,
+                          StygianType type) {
+  StygianCmdRecord record;
+  memset(&record, 0, sizeof(record));
+  record.element_id = element ? (uint32_t)(element - 1u) : UINT32_MAX;
+  record.property_id = STYGIAN_CMD_PROP_TYPE;
+  record.payload.type.type = (uint32_t)type;
+  return stygian_cmd_append_record(buffer, &record);
+}
+
+bool stygian_cmd_set_visible(StygianCmdBuffer *buffer, StygianElement element,
+                             bool visible) {
+  StygianCmdRecord record;
+  memset(&record, 0, sizeof(record));
+  record.element_id = element ? (uint32_t)(element - 1u) : UINT32_MAX;
+  record.property_id = STYGIAN_CMD_PROP_VISIBLE;
+  record.payload.visible.visible = visible ? 1u : 0u;
+  return stygian_cmd_append_record(buffer, &record);
+}
+
+bool stygian_cmd_set_z(StygianCmdBuffer *buffer, StygianElement element,
+                       float z) {
+  StygianCmdRecord record;
+  memset(&record, 0, sizeof(record));
+  record.element_id = element ? (uint32_t)(element - 1u) : UINT32_MAX;
+  record.property_id = STYGIAN_CMD_PROP_Z;
+  record.payload.depth.z = z;
+  return stygian_cmd_append_record(buffer, &record);
+}
+
+bool stygian_cmd_set_texture(StygianCmdBuffer *buffer, StygianElement element,
+                             StygianTexture texture, float u0, float v0,
+                             float u1, float v1) {
+  StygianCmdRecord record;
+  memset(&record, 0, sizeof(record));
+  record.element_id = element ? (uint32_t)(element - 1u) : UINT32_MAX;
+  record.property_id = STYGIAN_CMD_PROP_TEXTURE;
+  record.payload.texture.texture = (uint32_t)texture;
+  record.payload.texture.u0 = u0;
+  record.payload.texture.v0 = v0;
+  record.payload.texture.u1 = u1;
+  record.payload.texture.v1 = v1;
+  return stygian_cmd_append_record(buffer, &record);
+}
+
+bool stygian_cmd_set_shadow(StygianCmdBuffer *buffer, StygianElement element,
+                            float offset_x, float offset_y, float blur,
+                            float spread, float r, float g, float b, float a) {
+  StygianCmdRecord record;
+  memset(&record, 0, sizeof(record));
+  record.element_id = element ? (uint32_t)(element - 1u) : UINT32_MAX;
+  record.property_id = STYGIAN_CMD_PROP_SHADOW;
+  record.payload.shadow.offset_x = offset_x;
+  record.payload.shadow.offset_y = offset_y;
+  record.payload.shadow.blur = blur;
+  record.payload.shadow.spread = spread;
+  record.payload.shadow.r = r;
+  record.payload.shadow.g = g;
+  record.payload.shadow.b = b;
+  record.payload.shadow.a = a;
+  return stygian_cmd_append_record(buffer, &record);
+}
+
+bool stygian_cmd_set_gradient(StygianCmdBuffer *buffer, StygianElement element,
+                              float angle, float r1, float g1, float b1,
+                              float a1, float r2, float g2, float b2,
+                              float a2) {
+  StygianCmdRecord record;
+  memset(&record, 0, sizeof(record));
+  record.element_id = element ? (uint32_t)(element - 1u) : UINT32_MAX;
+  record.property_id = STYGIAN_CMD_PROP_GRADIENT;
+  record.payload.gradient.angle = angle;
+  record.payload.gradient.r1 = r1;
+  record.payload.gradient.g1 = g1;
+  record.payload.gradient.b1 = b1;
+  record.payload.gradient.a1 = a1;
+  record.payload.gradient.r2 = r2;
+  record.payload.gradient.g2 = g2;
+  record.payload.gradient.b2 = b2;
+  record.payload.gradient.a2 = a2;
+  return stygian_cmd_append_record(buffer, &record);
+}
+
+bool stygian_cmd_set_hover(StygianCmdBuffer *buffer, StygianElement element,
+                           float hover) {
+  StygianCmdRecord record;
+  memset(&record, 0, sizeof(record));
+  record.element_id = element ? (uint32_t)(element - 1u) : UINT32_MAX;
+  record.property_id = STYGIAN_CMD_PROP_HOVER;
+  record.payload.scalar.value = hover;
+  return stygian_cmd_append_record(buffer, &record);
+}
+
+bool stygian_cmd_set_blend(StygianCmdBuffer *buffer, StygianElement element,
+                           float blend) {
+  StygianCmdRecord record;
+  memset(&record, 0, sizeof(record));
+  record.element_id = element ? (uint32_t)(element - 1u) : UINT32_MAX;
+  record.property_id = STYGIAN_CMD_PROP_BLEND;
+  record.payload.scalar.value = blend;
+  return stygian_cmd_append_record(buffer, &record);
+}
+
+bool stygian_cmd_set_blur(StygianCmdBuffer *buffer, StygianElement element,
+                          float blur_radius) {
+  StygianCmdRecord record;
+  memset(&record, 0, sizeof(record));
+  record.element_id = element ? (uint32_t)(element - 1u) : UINT32_MAX;
+  record.property_id = STYGIAN_CMD_PROP_BLUR;
+  record.payload.scalar.value = blur_radius;
+  return stygian_cmd_append_record(buffer, &record);
+}
+
+bool stygian_cmd_set_glow(StygianCmdBuffer *buffer, StygianElement element,
+                          float intensity) {
+  StygianCmdRecord record;
+  memset(&record, 0, sizeof(record));
+  record.element_id = element ? (uint32_t)(element - 1u) : UINT32_MAX;
+  record.property_id = STYGIAN_CMD_PROP_GLOW;
+  record.payload.scalar.value = intensity;
+  return stygian_cmd_append_record(buffer, &record);
 }
 
 void stygian_set_clip(StygianContext *ctx, StygianElement e, uint8_t clip_id) {

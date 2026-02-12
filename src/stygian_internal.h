@@ -4,6 +4,7 @@
 #define STYGIAN_INTERNAL_H
 
 #include "../include/stygian.h"
+#include "../include/stygian_cmd.h"
 #include "../include/stygian_memory.h"
 #include <string.h>
 
@@ -143,9 +144,97 @@ typedef struct {
   uint32_t range_count;
   uint8_t clip_snapshot;
   float z_snapshot;
+  uint32_t last_dirty_reason;
+  uint32_t last_source_tag;
+  uint32_t last_frame_index;
 } StygianScopeCacheEntry;
 
 #define STYGIAN_SCOPE_CACHE_CAPACITY 1024
+#define STYGIAN_CMD_MAX_PRODUCERS 16
+#define STYGIAN_CMD_QUEUE_CAPACITY 4096
+#define STYGIAN_ERROR_RING_CAPACITY 256
+#define STYGIAN_WINNER_RING_CAPACITY 512
+
+typedef struct StygianCmdRecord {
+  uint64_t scope_id;
+  uint64_t submit_seq;
+  uint32_t source_tag;
+  uint32_t cmd_index;
+  uint32_t element_id;
+  uint16_t property_id;
+  uint8_t op_priority;
+  uint8_t _pad0;
+  union {
+    struct {
+      float x, y, w, h;
+    } bounds;
+    struct {
+      float r, g, b, a;
+    } color;
+    struct {
+      float tl, tr, br, bl;
+    } radius;
+    struct {
+      uint32_t type;
+    } type;
+    struct {
+      uint32_t visible;
+    } visible;
+    struct {
+      float z;
+    } depth;
+    struct {
+      uint32_t texture;
+      float u0, v0, u1, v1;
+    } texture;
+    struct {
+      float offset_x, offset_y, blur, spread;
+      float r, g, b, a;
+    } shadow;
+    struct {
+      float angle;
+      float r1, g1, b1, a1;
+      float r2, g2, b2, a2;
+    } gradient;
+    struct {
+      float value;
+    } scalar;
+  } payload;
+} StygianCmdRecord;
+
+typedef struct StygianCmdQueueEpoch {
+  StygianCmdRecord *records;
+  uint32_t count;
+  uint32_t dropped;
+} StygianCmdQueueEpoch;
+
+typedef struct StygianCmdProducerQueue {
+  uint32_t owner_thread_id;
+  uint32_t registered_order;
+  StygianCmdQueueEpoch epoch[2];
+} StygianCmdProducerQueue;
+
+struct StygianCmdBuffer {
+  struct StygianContext *ctx;
+  uint32_t queue_index;
+  uint32_t epoch;
+  uint32_t source_tag;
+  uint64_t scope_id;
+  uint32_t begin_index;
+  uint32_t count;
+  bool active;
+};
+
+typedef struct StygianWinnerRecord {
+  uint64_t scope_id;
+  uint64_t winner_submit_seq;
+  uint32_t frame_index;
+  uint32_t element_id;
+  uint16_t property_id;
+  uint16_t _pad0;
+  uint32_t winner_source_tag;
+  uint32_t winner_cmd_index;
+} StygianWinnerRecord;
 
 // ============================================================================
 // Font Atlas
@@ -340,14 +429,20 @@ struct StygianContext {
   float last_frame_build_ms;
   float last_frame_submit_ms;
   float last_frame_present_ms;
+  float last_frame_gpu_ms;
+  uint32_t last_frame_reason_flags;
+  uint32_t last_frame_eval_only;
   uint32_t frame_index;
   uint64_t frame_begin_cpu_ms;
   bool skip_frame;         // DDI: True if all scopes clean, skip submit/swap
+  bool eval_only_frame;    // Evaluate widgets/state but skip GPU submit/swap
+  StygianFrameIntent frame_intent;
   uint32_t frames_skipped; // DDI: Counter for no-op frames
 
   // Cumulative stats (reset each log interval)
   uint32_t stats_frames_rendered;
   uint32_t stats_frames_skipped;
+  uint32_t stats_frames_eval_only;
   uint64_t stats_total_upload_bytes;
   uint32_t stats_scope_replay_hits;
   uint32_t stats_scope_replay_misses;
@@ -355,6 +450,10 @@ struct StygianContext {
   float stats_total_build_ms;
   float stats_total_submit_ms;
   float stats_total_present_ms;
+  uint32_t stats_reason_mutation;
+  uint32_t stats_reason_timer;
+  uint32_t stats_reason_async;
+  uint32_t stats_reason_forced;
   uint32_t stats_log_interval_ms; // 0 = disabled, default 10000
   uint64_t stats_last_log_ms;
 
@@ -372,6 +471,27 @@ struct StygianContext {
   uint32_t scope_replay_cursor;
   uint32_t scope_replay_end;
   bool suppress_element_writes;
+
+  StygianCmdProducerQueue cmd_queues[STYGIAN_CMD_MAX_PRODUCERS];
+  StygianCmdBuffer cmd_buffers[STYGIAN_CMD_MAX_PRODUCERS];
+  uint32_t cmd_queue_count;
+  uint32_t cmd_publish_epoch;
+  uint64_t cmd_submit_seq_next;
+  bool cmd_committing;
+  uint32_t last_commit_applied;
+  uint32_t total_command_drops;
+  StygianCmdRecord *cmd_merge_records;
+  uint32_t cmd_merge_capacity;
+
+  StygianWinnerRecord winner_ring[STYGIAN_WINNER_RING_CAPACITY];
+  uint32_t winner_ring_head;
+
+  StygianContextErrorCallback error_callback;
+  void *error_callback_user_data;
+  StygianContextErrorRecord error_ring[STYGIAN_ERROR_RING_CAPACITY];
+  uint32_t error_ring_head;
+  uint32_t error_ring_count;
+  uint32_t error_ring_dropped;
 
   // NOTE: GPU resources (SSBO, VAO, VBO, program) are now owned by StygianAP
   // The old StygianBackend interface is deprecated
