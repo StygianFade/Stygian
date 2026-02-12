@@ -349,6 +349,8 @@ static void stygian_scope_dirty_reason(StygianContext *ctx, StygianScopeId id,
 static int stygian_cmd_compare(const void *lhs, const void *rhs) {
   const StygianCmdRecord *a = (const StygianCmdRecord *)lhs;
   const StygianCmdRecord *b = (const StygianCmdRecord *)rhs;
+  // Deterministic per-property merge key:
+  // (scope, element, property, priority, submit_seq, cmd_index).
   if (a->scope_id < b->scope_id)
     return -1;
   if (a->scope_id > b->scope_id)
@@ -503,6 +505,8 @@ static uint32_t stygian_commit_pending_commands(StygianContext *ctx) {
   if (!ctx || !ctx->cmd_merge_records || ctx->cmd_merge_capacity == 0u)
     return 0u;
 
+  // Freeze current producer epoch and flip publishers to the other epoch so
+  // commit reads a stable snapshot without producer-side locking.
   frozen_epoch = ctx->cmd_publish_epoch;
   ctx->cmd_committing = true;
   ctx->cmd_publish_epoch = frozen_epoch ^ 1u;
@@ -537,6 +541,7 @@ static uint32_t stygian_commit_pending_commands(StygianContext *ctx) {
   }
 
   if (merge_count > 1u) {
+    // Stable ordering removes producer timing variance across runs.
     qsort(ctx->cmd_merge_records, merge_count, sizeof(StygianCmdRecord),
           stygian_cmd_compare);
   }
@@ -1320,8 +1325,7 @@ StygianContext *stygian_create(const StygianConfig *config) {
   // Create per-frame scratch arena (4MB default)
   ctx->frame_arena = stygian_arena_create(4 * 1024 * 1024);
 
-  // Allocate element pool
-  // ctx->elements removed (AoS elimination)
+  // Allocate stable ID/free-list storage for SoA pools.
   ctx->free_list = (uint32_t *)stygian_alloc_array(
       allocator, ctx->config.max_elements, sizeof(uint32_t), _Alignof(uint32_t),
       true);
@@ -1337,7 +1341,7 @@ StygianContext *stygian_create(const StygianConfig *config) {
   }
   ctx->free_count = ctx->config.max_elements;
 
-  // Allocate SoA arrays (3 SSBOs — zero-filled for safe cold defaults)
+  // Allocate SoA arrays; zero-fill keeps untouched cold fields deterministic.
   {
     uint32_t max_el = ctx->config.max_elements;
     ctx->soa.hot = (StygianSoAHot *)stygian_alloc_array(
@@ -1522,9 +1526,7 @@ void stygian_destroy(StygianContext *ctx) {
     ctx->ap = NULL;
   }
 
-  // Note: Window is NOT destroyed here - it's owned externally
-
-  // ctx->elements removed (AoS elimination)
+  // Window lifetime is external to the context.
   for (uint32_t qi = 0u; qi < STYGIAN_CMD_MAX_PRODUCERS; qi++) {
     for (uint32_t epoch = 0u; epoch < 2u; epoch++) {
       stygian_free_raw(allocator, ctx->cmd_queues[qi].epoch[epoch].records);
@@ -1583,7 +1585,7 @@ void stygian_begin_frame_intent(StygianContext *ctx, int width, int height,
   ctx->width = width;
   ctx->height = height;
 
-  // DDI: Check if any scopes are dirty.
+  // Frame routing uses scope dirtiness plus repaint scheduler state.
   bool has_dirty_overlay_scopes = false;
   bool has_dirty_non_overlay_scopes = false;
   bool repaint_due = false;
@@ -1602,14 +1604,13 @@ void stygian_begin_frame_intent(StygianContext *ctx, int width, int height,
   }
   repaint_due = stygian_has_pending_repaint(ctx);
 
-  // DDI: Full reset when immediate mode is active or any scope is dirty.
+  // Non-overlay dirtiness rebuilds frame output from scratch.
   if (ctx->scope_count == 0 || has_dirty_non_overlay_scopes) {
-    // Reset ALL elements for Immediate Mode rendering or dirty scopes
     ctx->element_count = 0;
     ctx->transient_start = 0;
     ctx->transient_count = 0;
 
-    // Rebuild free list (all elements available)
+    // Rebuild allocator cursor so subsequent writes replay deterministically.
     for (uint32_t i = 0; i < ctx->config.max_elements; i++) {
       ctx->free_list[i] = ctx->config.max_elements - 1 - i;
     }
@@ -1629,9 +1630,8 @@ void stygian_begin_frame_intent(StygianContext *ctx, int width, int height,
     ctx->free_count = ctx->config.max_elements;
     ctx->skip_frame = false;
   } else if (repaint_due) {
-    // All scopes are currently clean, but a repaint is due (timer/deferred/
-    // request-only evaluation). Rebuild free-list cursor so clean scopes can
-    // replay deterministically from slot 0 without forcing invalidation.
+    // Timer/forced repaint with clean scopes still starts replay from slot 0;
+    // this keeps evaluate/replay deterministic without dirtying scopes.
     ctx->element_count = 0;
     ctx->transient_start = 0;
     ctx->transient_count = 0;
@@ -1641,9 +1641,8 @@ void stygian_begin_frame_intent(StygianContext *ctx, int width, int height,
     ctx->free_count = ctx->config.max_elements;
     ctx->skip_frame = false;
   } else {
-    // DDI: All scopes clean - preserve element data, skip submit/swap
+    // Fully clean frame: preserve cached data and skip GPU work.
     ctx->skip_frame = true;
-    // Element data preserved, free list preserved, scopes will replay
   }
 
   // Reset clip stack
@@ -1887,9 +1886,8 @@ void stygian_end_frame(StygianContext *ctx) {
 
   t_build_end = stygian_now_ms();
 
-  // DDI: Eval-only or clean-scope frames skip submit/draw/swap.
+  // Eval-only and fully clean frames keep state fresh with zero AP work.
   if (ctx->skip_frame || ctx->eval_only_frame) {
-    // No-op frame - all scopes clean, preserve GPU state
     ctx->frames_skipped++;
     ctx->last_frame_element_count = ctx->element_count;
     ctx->last_frame_clip_count = ctx->clip_count;
@@ -1931,11 +1929,11 @@ void stygian_end_frame(StygianContext *ctx) {
                         ctx->chunk_count, ctx->chunk_size);
 
   if (ctx->layer_count == 0) {
-    // Submit elements to AP (single-pass)
+    // Single pass when no layered ordering is requested.
     stygian_ap_draw(ctx->ap);
     ctx->frame_draw_calls++;
   } else {
-    // Multi-pass draw (layers + core gaps), using instance ranges.
+    // Layered draws preserve ordering while keeping contiguous gap ranges valid.
     uint32_t prev_end = 0;
     for (uint16_t i = 0; i < ctx->layer_count; i++) {
       uint32_t layer_start = ctx->layers[i].start;
@@ -1979,17 +1977,17 @@ void stygian_end_frame(StygianContext *ctx) {
   ctx->last_frame_eval_only = 0u;
   ctx->frame_index++;
 
-  // End frame (finalize)
+  // Finalize backend frame state before present.
   stygian_ap_end_frame(ctx->ap);
 
-  // Swap buffers
+  // Present only on render-intent frames.
   stygian_ap_swap(ctx->ap);
   t_present_end = stygian_now_ms();
   ctx->last_frame_present_ms = (float)(t_present_end - t_submit_end);
 
   stygian_repaint_end_frame(ctx);
 
-  // Accumulate cumulative stats
+  // Accumulate rolling diagnostics for periodic logs.
   ctx->stats_frames_rendered++;
   ctx->stats_total_upload_bytes += ctx->last_frame_upload_bytes;
   ctx->stats_scope_replay_hits += ctx->last_frame_scope_replay_hits;
@@ -2008,7 +2006,7 @@ void stygian_end_frame(StygianContext *ctx) {
   if (ctx->last_frame_reason_flags & STYGIAN_REPAINT_REASON_FORCED)
     ctx->stats_reason_forced++;
 
-  // Periodic stats log
+  // Periodic machine-readable telemetry for perf gates.
   if (ctx->stats_log_interval_ms > 0u) {
     uint64_t now_ms = stygian_now_ms();
     uint64_t elapsed = now_ms - ctx->stats_last_log_ms;
@@ -2326,8 +2324,6 @@ uint32_t stygian_element_batch(StygianContext *ctx, uint32_t count,
   for (uint32_t i = 0; i < n; i++) {
     uint32_t id = ctx->free_list[--ctx->free_count];
     out_ids[i] = id + 1; // 1-based handle
-
-    // AoS init removed (Phase 5.6)
 
     // SoA init
     memset(&ctx->soa.hot[id], 0, sizeof(StygianSoAHot));
@@ -2960,7 +2956,6 @@ StygianElement stygian_begin_metaball_group(StygianContext *ctx) {
   stygian_set_blend(ctx, group, 10.0f); // Default smoothness
 
   // Store start index of CHILDREN (next element) in reserved[0]
-  // Store start index of CHILDREN (next element) in reserved[0]
   // Used for auto-sizing the container later
   uint32_t id = group - 1;
   ctx->soa.appearance[id].control_points[0] = (float)ctx->element_count;
@@ -3572,8 +3567,6 @@ StygianElement stygian_text(StygianContext *ctx, StygianFont font,
         ctx->soa.appearance[id].uv[2] = 1.0f;
         ctx->soa.appearance[id].uv[3] = 1.0f;
         stygian_mark_soa_appearance_dirty(ctx, id);
-
-        // Legacy AoS removed (Phase 5.6)
 
         cursor = emoji_after;
         cursor_x += emoji_px;

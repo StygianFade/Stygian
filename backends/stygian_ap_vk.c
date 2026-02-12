@@ -519,6 +519,7 @@ static void update_gpu_timer_sample_for_frame(StygianAP *ap,
   query_base = frame_slot * 2u;
   timestamps[0] = 0u;
   timestamps[1] = 0u;
+  // Non-blocking read: if timestamps are not ready yet, keep previous sample.
   result = vkGetQueryPoolResults(
       ap->device, ap->gpu_timer_query_pool, query_base, 2u, sizeof(timestamps),
       timestamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
@@ -1941,7 +1942,7 @@ void stygian_ap_submit_soa(StygianAP *ap, const StygianSoAHot *hot,
   if (!ap || !hot || !appearance || !effects || !chunks || element_count == 0)
     return;
 
-  // Clamp to tracked chunk count
+  // Clamp to AP mirror metadata; commit side owns authoritative chunk count.
   if (chunk_count > ap->soa_chunk_count) {
     chunk_count = ap->soa_chunk_count;
   }
@@ -1949,7 +1950,7 @@ void stygian_ap_submit_soa(StygianAP *ap, const StygianSoAHot *hot,
   ap->last_upload_bytes = 0u;
   ap->last_upload_ranges = 0u;
 
-  // Map all three SoA buffers once for the entire upload pass
+  // Map once per frame and copy only dirty ranges to keep upload cost bounded.
   void *hot_mapped = NULL;
   void *app_mapped = NULL;
   void *eff_mapped = NULL;
@@ -2883,7 +2884,7 @@ void stygian_ap_surface_begin(StygianAP *ap, StygianAPSurface *surface,
       .maxDepth = 1.0f,
   };
 
-  // DEBUG: Print surface extent periodically
+  // Periodic floating-surface extent log for resize diagnostics.
   static int surf_debug = 0;
   if (surf_debug++ % 600 == 0) {
     if (surface != ap->main_surface) { // Only log floating windows

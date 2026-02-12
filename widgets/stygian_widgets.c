@@ -1342,11 +1342,6 @@ void stygian_modal_end(StygianContext *ctx, StygianModal *state) {
   g_modal_runtime.active = false;
 }
 
-// ... (button, etc)
-
-// ... INSIDE stygian_text_area ...
-// (Need separate patch for that, this chunk is strictly beginning of file)
-
 // ============================================================================
 // Button Widget
 // ============================================================================
@@ -1954,8 +1949,7 @@ bool stygian_text_input(StygianContext *ctx, StygianFont font, float x, float y,
 
   // Render border if focused
   if (focused) {
-    // TODO: Use STYGIAN_RECT_OUTLINE when available
-    // For now, just render a subtle highlight
+    // Keep focus highlight as a filled inset until outline primitive is shared.
     stygian_rect_rounded(ctx, x - 1, y - 1, w + 2, h + 2, 0.4f, 0.6f, 0.9f,
                          0.3f, 4.0f);
   }
@@ -1977,7 +1971,7 @@ bool stygian_text_input(StygianContext *ctx, StygianFont font, float x, float y,
     float cursor_y = y + 4.0f;
     float cursor_h = h - 8.0f;
 
-    // Blinking cursor (simple version - always visible for now)
+    // Keep cursor always visible to avoid timer repaint pressure in text input.
     stygian_rect(ctx, cursor_x, cursor_y, 2.0f, cursor_h, 1.0f, 1.0f, 1.0f,
                  1.0f);
   }
@@ -2054,8 +2048,7 @@ static bool iter_next_line(TextAreaIter *it, const char **out_start,
       return true;
     }
 
-    // Measure char (Brutal: using fixed step or real measure)
-    // Fast ASCII advance from LUT, fallback for non-ASCII
+    // Fast path uses ASCII LUT; non-ASCII falls back to font measurement.
     unsigned char uc = (unsigned char)*scan;
     float cw = (uc < 128) ? it->advance_lut[uc]
                           : stygian_text_width(it->ctx, it->font,
@@ -2327,7 +2320,8 @@ bool stygian_text_area(StygianContext *ctx, StygianFont font,
             state->cursor_idx++;
             p++;
           }
-          free(clip); // Use standard free (matches _strdup)
+          // Clipboard pop returns CRT-owned memory; free with matching runtime.
+          free(clip);
           state->selection_start = state->selection_end = state->cursor_idx;
           changed = true;
         }

@@ -1,7 +1,7 @@
 // stygian_ap_gl.c - OpenGL 4.3+ Access Point Implementation
 // Part of Stygian UI Library
 // DISCIPLINE: Only GPU operations. No layout, no fonts, no hit testing.
-#include "../include/stygian.h" // For StygianGPUElement
+#include "../include/stygian.h" // Public enums/types shared with AP.
 #include "../include/stygian_memory.h"
 #include "../src/stygian_internal.h" // For SoA struct types
 #include "../window/stygian_window.h"
@@ -1030,7 +1030,7 @@ void stygian_ap_submit(StygianAP *ap, const StygianSoAHot *soa_hot,
 
   ap->element_count = count;
 
-  // Map GL texture handles to compact sampler indices [0..N-1].
+  // Remap sparse texture handles to dense sampler slots per submit.
   // Texture unit routing:
   //   unit 1: font atlas
   //   units 2..(2+N-1): image textures (STYGIAN_TEXTURE)
@@ -1063,7 +1063,7 @@ void stygian_ap_submit(StygianAP *ap, const StygianSoAHot *soa_hot,
           slot = STYGIAN_GL_IMAGE_SAMPLERS;
         }
       }
-      // Keep CPU source immutable; write remapped slot to submit stream only.
+      // Keep source SoA immutable; only the submit stream gets remapped IDs.
       ap->submit_hot[i].texture_id = slot;
     }
   }
@@ -1092,9 +1092,8 @@ void stygian_ap_submit_soa(StygianAP *ap, const StygianSoAHot *hot,
   ap->last_upload_bytes = 0u;
   ap->last_upload_ranges = 0u;
 
-  // Ensure GPU version arrays are large enough
+  // Clamp to tracked chunk metadata; submit must never walk past AP mirrors.
   if (chunk_count > ap->soa_chunk_count) {
-    // Should not happen if config is consistent, but guard anyway
     chunk_count = ap->soa_chunk_count;
   }
 
@@ -1104,7 +1103,7 @@ void stygian_ap_submit_soa(StygianAP *ap, const StygianSoAHot *hot,
 
     // --- Hot buffer ---
     if (ap->gpu_hot_versions && c->hot_version != ap->gpu_hot_versions[ci]) {
-      // Determine upload range
+      // Upload only dirty span to preserve DDI scaling on tiny mutations.
       uint32_t dmin = c->hot_dirty_min;
       uint32_t dmax = c->hot_dirty_max;
       if (dmin <= dmax) {
@@ -1353,10 +1352,7 @@ void stygian_ap_surface_destroy(StygianAP *ap, StygianAPSurface *surface) {
   if (!ap || !surface)
     return;
 
-  // HDC is released automatically when window is destroyed?
-  // Actually ReleaseDC is needed if GetDC was called.
-  // stygian_window_native_context might return a persistent DC or temp.
-  // Assuming persistent for now or handled by window class.
+  // Window layer owns native DC lifetime; surface teardown only frees wrapper.
 
   ap_free(ap, surface);
 }
@@ -1382,10 +1378,7 @@ void stygian_ap_surface_begin(StygianAP *ap, StygianAPSurface *surface,
 
   glUseProgram(ap->program);
 
-  // Use LOGICAL size for projection if we want to match layout
-  // But surface_begin receives 'width' which might be Physical or Logical
-  // depending on caller. In dock_impl we pass Physical.
-  // So we should query logical size from window to be safe?
+  // Projection uses logical size to match UI layout coordinates across DPI.
   int log_w, log_h;
   if (surface->window) {
     stygian_window_get_size(surface->window, &log_w, &log_h);
@@ -1414,15 +1407,14 @@ void stygian_ap_surface_begin(StygianAP *ap, StygianAPSurface *surface,
 
 void stygian_ap_surface_submit(StygianAP *ap, StygianAPSurface *surface,
                                const StygianSoAHot *soa_hot, uint32_t count) {
-  // Reuse main submit logic but targeting current context
-  // We just need to upload to SSBO (shared context!)
+  // Shared context path: reuse main submit/draw to preserve AP parity.
   stygian_ap_submit(ap, soa_hot, count);
   stygian_ap_draw(ap);
   stygian_ap_end_frame(ap);
 }
 
 void stygian_ap_surface_end(StygianAP *ap, StygianAPSurface *surface) {
-  // Nothing specific needed for GL if submitted
+  // No additional GL work; submit path already flushed commands.
   (void)ap;
   (void)surface;
 }
@@ -1433,8 +1425,7 @@ void stygian_ap_surface_swap(StygianAP *ap, StygianAPSurface *surface) {
 
   stygian_window_gl_swap_buffers(surface->window);
 
-  // Restore main context? Not strictly necessary if next begin switches it
-  // back.
+  // Main context restoration is handled by the next surface/main begin call.
 }
 
 void stygian_ap_make_current(StygianAP *ap) {
@@ -1451,9 +1442,7 @@ void stygian_ap_set_viewport(StygianAP *ap, int width, int height) {
     return;
   glViewport(0, 0, width, height);
 
-  // Restore projection uniform to match main window's logical size
-  // This is critical when switching back from a floating window (which changed
-  // the uniform)
+  // Restore logical projection after multi-surface switches.
   if (ap->window) {
     int log_w, log_h;
     stygian_window_get_size(ap->window, &log_w, &log_h);

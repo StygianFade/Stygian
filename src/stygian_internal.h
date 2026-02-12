@@ -161,7 +161,9 @@ typedef struct StygianCmdRecord {
   uint32_t source_tag;
   uint32_t cmd_index;
   uint32_t element_id;
+  // Property-level merge keeps unrelated fields from clobbering each other.
   uint16_t property_id;
+  // Lower value applies first; later keys win for deterministic last-write-wins.
   uint8_t op_priority;
   uint8_t _pad0;
   union {
@@ -203,6 +205,7 @@ typedef struct StygianCmdRecord {
 } StygianCmdRecord;
 
 typedef struct StygianCmdQueueEpoch {
+  // Producers append here; commit reads the frozen epoch only.
   StygianCmdRecord *records;
   uint32_t count;
   uint32_t dropped;
@@ -232,6 +235,7 @@ typedef struct StygianWinnerRecord {
   uint32_t element_id;
   uint16_t property_id;
   uint16_t _pad0;
+  // Provenance for deterministic conflict resolution diagnostics.
   uint32_t winner_source_tag;
   uint32_t winner_cmd_index;
 } StygianWinnerRecord;
@@ -366,7 +370,7 @@ struct StygianContext {
 
   int width, height;
 
-  // Element pool (AoS removed, now purely SoA)
+  // Element pool metadata and ID reuse state.
 
   uint32_t element_count;
 
