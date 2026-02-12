@@ -16,3 +16,4 @@ This folder is the canonical home for active Stygian documentation.
 - New docs go in one of the five active sections above.
 - Keep historical research and superseded plans in `context/`.
 - Link from this index whenever adding a new top-level doc.
+- Contributor and AI transparency policy: see `governance/contributor_attribution_policy.md`.

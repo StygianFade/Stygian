@@ -12,3 +12,4 @@ Use this section for team and quality policy:
 - `syntax_bible.md`
 - `dod_ddi_nonnegotiables.md`
 - `review_checklist.md`
+- `contributor_attribution_policy.md`
