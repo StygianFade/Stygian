@@ -1,2 +1,12 @@
 # Local Stygian tooling workspace (not part of shipped library source)
 tools/
+
+# Local-only work areas
+deprecated/
+examples/deprecated/
+docs/context/
+
+# Heavy local runtime assets
+assets/triad/
+assets/sgc/*
+!assets/sgc/emoji_zstd_train.sgc

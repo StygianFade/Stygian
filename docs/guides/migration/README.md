@@ -1,7 +1,7 @@
 # Migration Guides
 
-This folder covers migrations from deprecated examples and older APIs.
+This folder covers migrations between runtime/API revisions.
 
 ## Pages
 
-- `deprecated_examples_to_minis.md`
+- Add migration pages here when a public API transition requires one.
