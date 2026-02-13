@@ -54,6 +54,41 @@
       "entry_source": "examples/perf_pathological_suite.c",
       "output_stem": "perf_pathological_suite"
     },
+    "quickwindow": {
+      "backend": "gl",
+      "entry_source": "examples/quickwindow.c",
+      "output_stem": "quickwindow"
+    },
+    "quickwindow_vk": {
+      "backend": "vk",
+      "entry_source": "examples/quickwindow.c",
+      "output_stem": "quickwindow_vk"
+    },
+    "quickwindow_borderless": {
+      "backend": "gl",
+      "entry_source": "examples/quickwindow_borderless.c",
+      "output_stem": "quickwindow_borderless"
+    },
+    "quickwindow_custom_titlebar": {
+      "backend": "gl",
+      "entry_source": "examples/quickwindow_custom_titlebar.c",
+      "output_stem": "quickwindow_custom_titlebar"
+    },
+    "tier1_safety": {
+      "backend": "gl",
+      "entry_source": "tests/tier1_safety.c",
+      "output_stem": "tier1_safety"
+    },
+    "tier2_runtime": {
+      "backend": "gl",
+      "entry_source": "tests/tier2_runtime.c",
+      "output_stem": "tier2_runtime"
+    },
+    "tier3_misuse": {
+      "backend": "gl",
+      "entry_source": "tests/tier3_misuse.c",
+      "output_stem": "tier3_misuse"
+    },
     "text_editor_mini_vk": {
       "backend": "vk",
       "entry_source": "examples/text_editor_mini.c",
@@ -76,6 +111,11 @@
     }
   },
   "groups": {
+    "quick_smoke": [
+      "quickwindow",
+      "quickwindow_borderless",
+      "quickwindow_custom_titlebar"
+    ],
     "mini_apps_all": [
       "text_editor_mini",
       "calculator_mini",

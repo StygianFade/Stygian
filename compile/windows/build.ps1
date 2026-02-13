@@ -55,7 +55,8 @@ function Invoke-TargetBuild {
 
   $targetDef = $manifest.targets.$Name
   if (-not $targetDef) {
-    throw "unknown target: $Name"
+    $availableTargets = ($manifest.targets.PSObject.Properties.Name | Sort-Object) -join ", "
+    throw "unknown target: $Name`navailable targets: $availableTargets"
   }
 
   Test-ShaderOutputs -Name $Name -Skip:$NoShaderCheck
@@ -113,7 +114,8 @@ function Invoke-TargetBuild {
 if ($Group) {
   $groupDef = $manifest.groups.$Group
   if (-not $groupDef) {
-    throw "unknown group: $Group"
+    $availableGroups = ($manifest.groups.PSObject.Properties.Name | Sort-Object) -join ", "
+    throw "unknown group: $Group`navailable groups: $availableGroups"
   }
   foreach ($name in $groupDef) {
     Invoke-TargetBuild -Name $name

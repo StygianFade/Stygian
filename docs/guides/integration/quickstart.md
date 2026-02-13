@@ -1,48 +1,114 @@
 # Quickstart
 
-## 1. Create a Window
+This sample is `examples/quickwindow.c`.
 
-Use `stygian_window_create` or `stygian_window_create_simple`.
+## 1. Minimal Compilable Program
 
-## 2. Create Context
+```c
+#include "stygian.h"
+#include "stygian_window.h"
 
-Build `StygianConfig` with:
-- backend (`OPENGL` or `VULKAN`)
-- max elements
-- max textures
-- window pointer
-- optional shader dir and allocator
+#ifdef STYGIAN_DEMO_VULKAN
+#define STYGIAN_QUICK_BACKEND STYGIAN_BACKEND_VULKAN
+#define STYGIAN_QUICK_WINDOW_RENDER_FLAG STYGIAN_WINDOW_VULKAN
+#else
+#define STYGIAN_QUICK_BACKEND STYGIAN_BACKEND_OPENGL
+#define STYGIAN_QUICK_WINDOW_RENDER_FLAG STYGIAN_WINDOW_OPENGL
+#endif
 
-Call `stygian_create`.
+int main(void) {
+    StygianWindowConfig win_cfg = {
+        .width = 1280,
+        .height = 720,
+        .title = "Stygian Quick Window",
+        .flags = STYGIAN_WINDOW_RESIZABLE | STYGIAN_QUICK_WINDOW_RENDER_FLAG,
+    };
+    StygianWindow *window = stygian_window_create(&win_cfg);
+    if (!window) return 1;
 
-## 3. Frame Loop Pattern
+    StygianConfig cfg = {
+        .backend = STYGIAN_QUICK_BACKEND,
+        .window = window,
+    };
+    StygianContext *ctx = stygian_create(&cfg);
+    if (!ctx) {
+        stygian_window_destroy(window);
+        return 1;
+    }
 
-1. Collect events.
-2. Feed widget/input processing.
-3. Decide frame intent:
-- render frame if mutation/repaint/async/first frame
-- eval-only frame for request-eval only
-4. `stygian_begin_frame_intent(...)`
-5. Build scopes and widgets.
-6. `stygian_end_frame(...)`
-7. Wait with `stygian_next_repaint_wait_ms(...)` when idle.
+    StygianFont font = stygian_font_load(ctx, "assets/atlas.png", "assets/atlas.json");
+    while (!stygian_window_should_close(window)) {
+        StygianEvent event;
+        while (stygian_window_poll_event(window, &event)) {
+            if (event.type == STYGIAN_EVENT_CLOSE) stygian_window_request_close(window);
+        }
 
-## 4. Shutdown
+        int width, height;
+        stygian_window_get_size(window, &width, &height);
+        stygian_begin_frame(ctx, width, height);
+        stygian_rect(ctx, 10, 10, 200, 100, 0.2f, 0.3f, 0.8f, 1.0f);
+        if (font) stygian_text(ctx, font, "Hello", 20, 50, 16.0f, 1, 1, 1, 1);
+        stygian_end_frame(ctx);
+    }
 
-- destroy context
-- destroy window
+    if (font) stygian_font_destroy(ctx, font);
+    stygian_destroy(ctx);
+    stygian_window_destroy(window);
+    return 0;
+}
+```
 
-## Build Entrypoints
+## 2. Windows Quick Test (copy/paste)
+
+1. Build shader outputs:
+   - `compile\windows\build_shaders.bat`
+2. Build quickwindow using the novice default:
+   - `compile\windows\build.bat`
+3. Run:
+   - `build\quickwindow.exe`
+
+Optional tiny tests:
+
+- Borderless window:
+  - `compile\windows\build_quickwindow_borderless.bat`
+  - `build\quickwindow_borderless.exe`
+- Custom titlebar window:
+  - `compile\windows\build_quickwindow_custom_titlebar.bat`
+  - `build\quickwindow_custom_titlebar.exe`
+
+## 3. Backend Switch Rules (must all match)
+
+1. `StygianConfig.backend` in source.
+2. Window render flag in source (`STYGIAN_WINDOW_OPENGL` or
+   `STYGIAN_WINDOW_VULKAN`).
+3. Build target backend in `compile/targets.json` (`"gl"` or `"vk"`).
+
+For quickwindow, switch by target:
+
+- OpenGL:
+   - `compile\windows\build_quickwindow.bat`
+- Vulkan:
+   - `compile\windows\build_quickwindow_vk.bat`
+
+Changing only the backend enum in C source can still compile while remaining
+mismatched at runtime.
+
+## 4. Build Entrypoints
 
 Manifest source of truth:
 - `compile/targets.json`
 
 Cross-platform runners:
-- Windows: `compile/run.ps1 -Target text_editor_mini`
-- Linux/macOS: `compile/run.sh --target text_editor_mini`
+- Windows: `compile/run.ps1 -Target quickwindow`
+- Linux/macOS: `compile/run.sh --target quickwindow`
 
-Windows convenience wrappers in repo root:
-Windows wrapper scripts:
+Windows convenience wrapper scripts:
+- `compile/windows/build.bat` (default quickwindow)
+- `compile/windows/build_quickwindow.bat`
+- `compile/windows/build_quickwindow_vk.bat`
+- `compile/windows/build_quickwindow_borderless.bat`
+- `compile/windows/build_quickwindow_custom_titlebar.bat`
+- `compile/windows/build_quick_smoke.bat`
 - `compile/windows/build_text_editor_mini.bat`
 - `compile/windows/build_calculator_mini.bat`
 - `compile/windows/build_calendar_mini.bat`

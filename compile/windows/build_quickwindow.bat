@@ -1,6 +1,5 @@
 @echo off
 setlocal
 cd /d "%~dp0\..\.."
-REM Default quick-start entrypoint for novice smoke test.
 powershell -NoProfile -ExecutionPolicy Bypass -File compile\windows\build.ps1 -Target quickwindow %*
 exit /b %ERRORLEVEL%

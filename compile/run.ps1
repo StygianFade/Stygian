@@ -37,7 +37,7 @@ if ($NoShaderCheck) {
 }
 
 if (-not $Target -and -not $Group) {
-  throw "specify -Target <name> or -Group <name>"
+  throw "specify -Target <name> or -Group <name>`nexample: powershell -File compile/run.ps1 -Target quickwindow"
 }
 
 powershell -NoProfile -ExecutionPolicy Bypass -File $runner @args
