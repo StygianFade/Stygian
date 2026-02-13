@@ -40,6 +40,9 @@ Manifest-driven build metadata lives in:
 
 Platform runners:
 
+- Unified:
+  - Windows: `compile/run.ps1`
+  - Linux/macOS: `compile/run.sh`
 - Windows: `compile/windows/build.ps1`
 - Linux: `compile/linux/build.sh`
 - macOS: `compile/macos/build.sh`
