@@ -1,7 +1,7 @@
 # Performance Gate Policy
 
 Gate runner:
-- `run_perf_gates.bat`
+- `compile/windows/run_perf_gates.bat`
 - implementation: `tests/run_perf_gates.ps1`
 
 ## Profiles

@@ -49,15 +49,15 @@ Platform runners:
 
 Windows convenience wrappers remain:
 
-- `build_text_editor_mini.bat`
-- `build_calculator_mini.bat`
-- `build_calendar_mini.bat`
-- `build_perf_pathological_suite.bat`
-- `build_mini_apps_all.bat`
+- `compile/windows/build_text_editor_mini.bat`
+- `compile/windows/build_calculator_mini.bat`
+- `compile/windows/build_calendar_mini.bat`
+- `compile/windows/build_perf_pathological_suite.bat`
+- `compile/windows/build_mini_apps_all.bat`
 
 Perf gate command:
 
-- `run_perf_gates.bat`
+- `compile/windows/run_perf_gates.bat`
 
 ## License
 

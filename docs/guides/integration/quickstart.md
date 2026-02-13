@@ -42,8 +42,9 @@ Cross-platform runners:
 - Linux/macOS: `compile/run.sh --target text_editor_mini`
 
 Windows convenience wrappers in repo root:
-- `build_text_editor_mini.bat`
-- `build_calculator_mini.bat`
-- `build_calendar_mini.bat`
-- VK variants with `_vk.bat`
-- matrix build: `build_mini_apps_all.bat`
+Windows wrapper scripts:
+- `compile/windows/build_text_editor_mini.bat`
+- `compile/windows/build_calculator_mini.bat`
+- `compile/windows/build_calendar_mini.bat`
+- VK variants with `_vk.bat` in `compile/windows/`
+- matrix build: `compile/windows/build_mini_apps_all.bat`
