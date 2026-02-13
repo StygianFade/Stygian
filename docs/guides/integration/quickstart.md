@@ -34,7 +34,15 @@ Call `stygian_create`.
 
 ## Build Entrypoints
 
-Use scripts in repo root:
+Manifest source of truth:
+- `compile/targets.json`
+
+Cross-platform runners:
+- Windows: `compile/windows/build.ps1 -Target text_editor_mini`
+- Linux: `compile/linux/build.sh text_editor_mini`
+- macOS: `compile/macos/build.sh text_editor_mini`
+
+Windows convenience wrappers in repo root:
 - `build_text_editor_mini.bat`
 - `build_calculator_mini.bat`
 - `build_calendar_mini.bat`

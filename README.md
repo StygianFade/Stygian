@@ -29,42 +29,32 @@ stygian_destroy(ctx);
 
 ## Backends
 
-- `backends/stygian_opengl.c` - OpenGL 4.3+
-- Vulkan (planned)
+- `backends/stygian_ap_gl.c` - OpenGL access point
+- `backends/stygian_ap_vk.c` - Vulkan access point
 
-## TRIAD Runtime (Current)
+## Build Targets
 
-Core runtime scaffolding for `.triad` packs now lives in `src` (not benchmark
-tools):
+Manifest-driven build metadata lives in:
 
-- `src/stygian_triad.c`
-- `src/stygian_triad.h`
+- `compile/targets.json`
 
-Public API in `include/stygian.h`:
+Platform runners:
 
-- `stygian_triad_mount`
-- `stygian_triad_unmount`
-- `stygian_triad_is_mounted`
-- `stygian_triad_get_pack_info`
-- `stygian_triad_lookup`
-- `stygian_triad_hash_key`
+- Windows: `compile/windows/build.ps1`
+- Linux: `compile/linux/build.sh`
+- macOS: `compile/macos/build.sh`
 
-Current scope:
+Windows convenience wrappers remain:
 
-- mount and index `TRIAD01` files
-- hash+lookup by `glyph_hash`
-- return payload metadata for next-stage decode/upload integration
+- `build_text_editor_mini.bat`
+- `build_calculator_mini.bat`
+- `build_calendar_mini.bat`
+- `build_perf_pathological_suite.bat`
+- `build_mini_apps_all.bat`
 
-Dedicated build script:
+Perf gate command:
 
-- `build_triad_runtime.bat` builds `build/triad_runtime_probe.exe`
-
-Live demo:
-
-- `build_chat_emoji_demo.bat` builds `build/chat_emoji_demo.exe`
-- Chat input accepts `:shortcode:` (example `:emoji_u1f600:`)
-- Demo resolves shortcode from mounted `.triad`, reads SVG payload, rasterizes,
-  caches texture, and renders inline in chat list
+- `run_perf_gates.bat`
 
 ## License
 

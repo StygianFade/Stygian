@@ -1,0 +1,90 @@
+{
+  "common": {
+    "includes": [
+      "include",
+      "window",
+      "backends",
+      "widgets",
+      "layout"
+    ],
+    "sources": [
+      "examples/mini_perf_harness.c",
+      "widgets/stygian_widgets.c",
+      "src/stygian.c",
+      "src/stygian_memory.c",
+      "src/stygian_triad.c",
+      "src/stygian_unicode.c",
+      "src/stygian_color.c",
+      "src/stygian_icc.c",
+      "src/stygian_mtsdf.c",
+      "src/stygian_clipboard.c",
+      "layout/stygian_layout.c",
+      "layout/stygian_tabs.c"
+    ],
+    "gl_backend_source": "backends/stygian_ap_gl.c",
+    "vk_backend_source": "backends/stygian_ap_vk.c",
+    "flags": [
+      "-std=c2x",
+      "-Wall",
+      "-O0",
+      "-g"
+    ],
+    "defines": [
+      "_CRT_SECURE_NO_WARNINGS"
+    ]
+  },
+  "targets": {
+    "text_editor_mini": {
+      "backend": "gl",
+      "entry_source": "examples/text_editor_mini.c",
+      "output_stem": "text_editor_mini"
+    },
+    "calculator_mini": {
+      "backend": "gl",
+      "entry_source": "examples/calculator_mini.c",
+      "output_stem": "calculator_mini"
+    },
+    "calendar_mini": {
+      "backend": "gl",
+      "entry_source": "examples/calendar_mini.c",
+      "output_stem": "calendar_mini"
+    },
+    "perf_pathological_suite": {
+      "backend": "gl",
+      "entry_source": "examples/perf_pathological_suite.c",
+      "output_stem": "perf_pathological_suite"
+    },
+    "text_editor_mini_vk": {
+      "backend": "vk",
+      "entry_source": "examples/text_editor_mini.c",
+      "output_stem": "text_editor_mini_vk"
+    },
+    "calculator_mini_vk": {
+      "backend": "vk",
+      "entry_source": "examples/calculator_mini.c",
+      "output_stem": "calculator_mini_vk"
+    },
+    "calendar_mini_vk": {
+      "backend": "vk",
+      "entry_source": "examples/calendar_mini.c",
+      "output_stem": "calendar_mini_vk"
+    },
+    "perf_pathological_suite_vk": {
+      "backend": "vk",
+      "entry_source": "examples/perf_pathological_suite.c",
+      "output_stem": "perf_pathological_suite_vk"
+    }
+  },
+  "groups": {
+    "mini_apps_all": [
+      "text_editor_mini",
+      "calculator_mini",
+      "calendar_mini",
+      "perf_pathological_suite",
+      "text_editor_mini_vk",
+      "calculator_mini_vk",
+      "calendar_mini_vk",
+      "perf_pathological_suite_vk"
+    ]
+  }
+}
