@@ -291,6 +291,11 @@ uint16_t stygian_get_clip_capacity(const StygianContext *ctx);
 uint32_t stygian_get_last_commit_applied(const StygianContext *ctx);
 uint32_t stygian_get_total_command_drops(const StygianContext *ctx);
 
+// Optional handle validation helpers (debug/dev ergonomics).
+bool stygian_element_is_valid(const StygianContext *ctx, StygianElement e);
+bool stygian_texture_is_valid(const StygianContext *ctx, StygianTexture tex);
+bool stygian_font_is_valid(const StygianContext *ctx, StygianFont font);
+
 // Optional render layering (multi-pass draws)
 // Use when a widget needs its own pass without breaking core UI batching.
 void stygian_layer_begin(StygianContext *ctx);

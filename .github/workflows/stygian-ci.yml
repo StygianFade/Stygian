@@ -1,0 +1,86 @@
+name: stygian-ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      run_runtime:
+        description: Run runtime tier suites (best effort)
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  windows-build:
+    name: Windows Build Checks
+    runs-on: windows-latest
+    env:
+      CLANG: C:\msys64\clang64\bin\clang.exe
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: true
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-zlib
+            mingw-w64-clang-x86_64-zstd
+
+      - name: Build tier targets
+        shell: pwsh
+        run: |
+          if (-not (Test-Path $env:CLANG)) {
+            throw "clang not found: $env:CLANG"
+          }
+          powershell -NoProfile -ExecutionPolicy Bypass -File compile\run.ps1 -Target tier1_safety -NoShaderCheck -Clang $env:CLANG
+          powershell -NoProfile -ExecutionPolicy Bypass -File compile\run.ps1 -Target tier2_runtime -NoShaderCheck -Clang $env:CLANG
+          powershell -NoProfile -ExecutionPolicy Bypass -File compile\run.ps1 -Target tier3_misuse -NoShaderCheck -Clang $env:CLANG
+          powershell -NoProfile -ExecutionPolicy Bypass -File compile\run.ps1 -Target calculator_mini -NoShaderCheck -Clang $env:CLANG
+
+  windows-runtime:
+    name: Windows Runtime Tiers (Manual)
+    if: github.event_name == 'workflow_dispatch' && inputs.run_runtime
+    runs-on: windows-latest
+    continue-on-error: true
+    env:
+      CLANG: C:\msys64\clang64\bin\clang.exe
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: true
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-zlib
+            mingw-w64-clang-x86_64-zstd
+
+      - name: Build shader outputs when available
+        id: shaders
+        shell: pwsh
+        run: |
+          $glslc = Get-Command glslc -ErrorAction SilentlyContinue
+          if (-not $glslc) {
+            Write-Host "glslc not found on this runner; skipping runtime tier execution."
+            "skip_runtime=1" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            exit 0
+          }
+          cmd /c compile\windows\build_shaders.bat
+          "skip_runtime=0" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Run tier stack
+        if: steps.shaders.outputs.skip_runtime != '1'
+        shell: pwsh
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File tests\run_all.ps1 -Rebuild

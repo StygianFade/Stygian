@@ -261,6 +261,123 @@ static uint32_t stygian_hash_u32(uint32_t v) {
   return v;
 }
 
+#define STYGIAN_HANDLE_INDEX_BITS 20u
+#define STYGIAN_HANDLE_INDEX_MASK ((1u << STYGIAN_HANDLE_INDEX_BITS) - 1u)
+#define STYGIAN_HANDLE_GENERATION_MASK (0xFFFFFFFFu ^ STYGIAN_HANDLE_INDEX_MASK)
+#define STYGIAN_HANDLE_MAX_GENERATION 4095u
+
+static uint32_t stygian_make_handle(uint32_t slot, uint16_t generation) {
+  uint32_t index_part = slot + 1u;
+  uint32_t generation_part = ((uint32_t)generation) << STYGIAN_HANDLE_INDEX_BITS;
+  return (generation_part & STYGIAN_HANDLE_GENERATION_MASK) |
+         (index_part & STYGIAN_HANDLE_INDEX_MASK);
+}
+
+static bool stygian_decode_handle(uint32_t handle, uint32_t capacity,
+                                  uint32_t *out_slot,
+                                  uint16_t *out_generation) {
+  uint32_t index_part;
+  uint32_t slot;
+  uint32_t generation_part;
+  if (handle == 0u)
+    return false;
+  index_part = handle & STYGIAN_HANDLE_INDEX_MASK;
+  if (index_part == 0u)
+    return false;
+  slot = index_part - 1u;
+  if (slot >= capacity)
+    return false;
+  generation_part = (handle >> STYGIAN_HANDLE_INDEX_BITS);
+  if (generation_part == 0u)
+    return false;
+  if (out_slot)
+    *out_slot = slot;
+  if (out_generation)
+    *out_generation = (uint16_t)generation_part;
+  return true;
+}
+
+static uint16_t stygian_bump_generation(uint16_t generation) {
+  uint32_t next = (uint32_t)generation + 1u;
+  if (next == 0u || next > STYGIAN_HANDLE_MAX_GENERATION)
+    next = 1u;
+  return (uint16_t)next;
+}
+
+static bool stygian_resolve_element_slot(const StygianContext *ctx,
+                                         StygianElement element,
+                                         uint32_t *out_slot) {
+  uint32_t slot;
+  uint16_t generation;
+  if (!ctx || !ctx->element_generations)
+    return false;
+  if (!stygian_decode_handle((uint32_t)element, ctx->config.max_elements, &slot,
+                             &generation))
+    return false;
+  if (ctx->element_generations[slot] != generation)
+    return false;
+  if (!(ctx->soa.hot[slot].flags & STYGIAN_FLAG_ALLOCATED))
+    return false;
+  if (out_slot)
+    *out_slot = slot;
+  return true;
+}
+
+static bool stygian_resolve_texture_slot(const StygianContext *ctx,
+                                         StygianTexture texture,
+                                         uint32_t *out_slot,
+                                         uint32_t *out_backend_id) {
+  uint32_t slot;
+  uint16_t generation;
+  if (!ctx || !ctx->texture_generations || !ctx->texture_backend_ids)
+    return false;
+  if (!stygian_decode_handle((uint32_t)texture, ctx->config.max_textures, &slot,
+                             &generation))
+    return false;
+  if (ctx->texture_generations[slot] != generation)
+    return false;
+  if (ctx->texture_backend_ids[slot] == 0u)
+    return false;
+  if (out_slot)
+    *out_slot = slot;
+  if (out_backend_id)
+    *out_backend_id = ctx->texture_backend_ids[slot];
+  return true;
+}
+
+static bool stygian_resolve_font_slot(const StygianContext *ctx, StygianFont font,
+                                      uint32_t *out_slot) {
+  uint32_t slot;
+  uint16_t generation;
+  if (!ctx || !ctx->font_generations || !ctx->font_alive)
+    return false;
+  if (!stygian_decode_handle((uint32_t)font, STYGIAN_MAX_FONTS, &slot,
+                             &generation))
+    return false;
+  if (ctx->font_generations[slot] != generation)
+    return false;
+  if (!ctx->font_alive[slot])
+    return false;
+  if (out_slot)
+    *out_slot = slot;
+  return true;
+}
+
+static void stygian_reset_element_pool(StygianContext *ctx) {
+  uint32_t i;
+  if (!ctx || !ctx->free_list || !ctx->element_generations)
+    return;
+  for (i = 0u; i < ctx->config.max_elements; i++) {
+    if (ctx->soa.hot[i].flags & STYGIAN_FLAG_ALLOCATED) {
+      ctx->element_generations[i] =
+          stygian_bump_generation(ctx->element_generations[i]);
+      ctx->soa.hot[i].flags = 0u;
+    }
+    ctx->free_list[i] = ctx->config.max_elements - 1u - i;
+  }
+  ctx->free_count = ctx->config.max_elements;
+}
+
 static uint32_t stygian_hash_cstr(const char *str) {
   uint32_t hash = 2166136261u;
   const unsigned char *p = (const unsigned char *)str;
@@ -419,9 +536,9 @@ static bool stygian_cmd_apply_one(StygianContext *ctx,
   StygianElement element;
   if (!ctx || !record)
     return false;
-  if (record->element_id == UINT32_MAX)
+  if (record->element_id == UINT32_MAX || record->element_handle == 0u)
     return false;
-  element = (StygianElement)(record->element_id + 1u);
+  element = (StygianElement)record->element_handle;
 
   switch (record->property_id) {
   case STYGIAN_CMD_PROP_BOUNDS:
@@ -1329,8 +1446,22 @@ StygianContext *stygian_create(const StygianConfig *config) {
   ctx->free_list = (uint32_t *)stygian_alloc_array(
       allocator, ctx->config.max_elements, sizeof(uint32_t), _Alignof(uint32_t),
       true);
+  ctx->element_generations = (uint16_t *)stygian_alloc_array(
+      allocator, ctx->config.max_elements, sizeof(uint16_t),
+      _Alignof(uint16_t), true);
 
-  if (!ctx->free_list) {
+  ctx->texture_free_list = (uint32_t *)stygian_alloc_array(
+      allocator, ctx->config.max_textures, sizeof(uint32_t),
+      _Alignof(uint32_t), true);
+  ctx->texture_generations = (uint16_t *)stygian_alloc_array(
+      allocator, ctx->config.max_textures, sizeof(uint16_t),
+      _Alignof(uint16_t), true);
+  ctx->texture_backend_ids = (uint32_t *)stygian_alloc_array(
+      allocator, ctx->config.max_textures, sizeof(uint32_t),
+      _Alignof(uint32_t), true);
+
+  if (!ctx->free_list || !ctx->element_generations || !ctx->texture_free_list ||
+      !ctx->texture_generations || !ctx->texture_backend_ids) {
     stygian_destroy(ctx);
     return NULL;
   }
@@ -1338,8 +1469,16 @@ StygianContext *stygian_create(const StygianConfig *config) {
   // Initialize free list (all elements free)
   for (uint32_t i = 0; i < ctx->config.max_elements; i++) {
     ctx->free_list[i] = ctx->config.max_elements - 1 - i; // Reverse order
+    ctx->element_generations[i] = 1u;
   }
   ctx->free_count = ctx->config.max_elements;
+  for (uint32_t i = 0; i < ctx->config.max_textures; i++) {
+    ctx->texture_free_list[i] = ctx->config.max_textures - 1 - i;
+    ctx->texture_generations[i] = 1u;
+    ctx->texture_backend_ids[i] = 0u;
+  }
+  ctx->texture_free_count = ctx->config.max_textures;
+  ctx->texture_count = 0u;
 
   // Allocate SoA arrays; zero-fill keeps untouched cold fields deterministic.
   {
@@ -1412,13 +1551,27 @@ StygianContext *stygian_create(const StygianConfig *config) {
 
   // Allocate font storage
   ctx->fonts = (StygianFontAtlas *)stygian_alloc_array(
-      allocator, 16u, sizeof(StygianFontAtlas), _Alignof(StygianFontAtlas),
-      true);
+      allocator, STYGIAN_MAX_FONTS, sizeof(StygianFontAtlas),
+      _Alignof(StygianFontAtlas), true);
+  ctx->font_free_list = (uint32_t *)stygian_alloc_array(
+      allocator, STYGIAN_MAX_FONTS, sizeof(uint32_t), _Alignof(uint32_t), true);
+  ctx->font_generations = (uint16_t *)stygian_alloc_array(
+      allocator, STYGIAN_MAX_FONTS, sizeof(uint16_t), _Alignof(uint16_t), true);
+  ctx->font_alive = (uint8_t *)stygian_alloc_array(
+      allocator, STYGIAN_MAX_FONTS, sizeof(uint8_t), _Alignof(uint8_t), true);
   ctx->triad_runtime = stygian_triad_runtime_create();
-  if (!ctx->fonts || !ctx->triad_runtime) {
+  if (!ctx->fonts || !ctx->font_free_list || !ctx->font_generations ||
+      !ctx->font_alive || !ctx->triad_runtime) {
     stygian_destroy(ctx);
     return NULL;
   }
+  for (uint32_t i = 0u; i < STYGIAN_MAX_FONTS; i++) {
+    ctx->font_free_list[i] = STYGIAN_MAX_FONTS - 1u - i;
+    ctx->font_generations[i] = 1u;
+    ctx->font_alive[i] = 0u;
+  }
+  ctx->font_free_count = STYGIAN_MAX_FONTS;
+  ctx->font_count = 0u;
 
   // Store window pointer (required)
   if (!config->window) {
@@ -1506,8 +1659,15 @@ void stygian_destroy(StygianContext *ctx) {
   // Free dynamic font-side allocations before releasing owning arrays.
   if (ctx->fonts) {
     uint32_t i;
-    for (i = 0; i < ctx->font_count; i++) {
-      stygian_font_free_dynamic(ctx, &ctx->fonts[i]);
+    for (i = 0; i < STYGIAN_MAX_FONTS; i++) {
+      if (ctx->font_alive && ctx->font_alive[i]) {
+        if (ctx->fonts[i].texture_handle) {
+          stygian_texture_destroy(ctx, ctx->fonts[i].texture_handle);
+          ctx->fonts[i].texture_handle = 0u;
+          ctx->fonts[i].texture_backend_id = 0u;
+        }
+        stygian_font_free_dynamic(ctx, &ctx->fonts[i]);
+      }
     }
   }
 
@@ -1538,12 +1698,19 @@ void stygian_destroy(StygianContext *ctx) {
   stygian_free_raw(allocator, ctx->cmd_merge_records);
   ctx->cmd_merge_records = NULL;
   stygian_free_raw(allocator, ctx->free_list);
+  stygian_free_raw(allocator, ctx->element_generations);
+  stygian_free_raw(allocator, ctx->texture_free_list);
+  stygian_free_raw(allocator, ctx->texture_generations);
+  stygian_free_raw(allocator, ctx->texture_backend_ids);
   stygian_free_raw(allocator, ctx->soa.hot);
   stygian_free_raw(allocator, ctx->soa.appearance);
   stygian_free_raw(allocator, ctx->soa.effects);
   stygian_free_raw(allocator, ctx->chunks);
   stygian_free_raw(allocator, ctx->clips);
   stygian_free_raw(allocator, ctx->fonts);
+  stygian_free_raw(allocator, ctx->font_free_list);
+  stygian_free_raw(allocator, ctx->font_generations);
+  stygian_free_raw(allocator, ctx->font_alive);
   stygian_triad_runtime_destroy(ctx->triad_runtime);
   ctx->triad_runtime = NULL;
   if (ctx->frame_arena) {
@@ -1611,10 +1778,7 @@ void stygian_begin_frame_intent(StygianContext *ctx, int width, int height,
     ctx->transient_count = 0;
 
     // Rebuild allocator cursor so subsequent writes replay deterministically.
-    for (uint32_t i = 0; i < ctx->config.max_elements; i++) {
-      ctx->free_list[i] = ctx->config.max_elements - 1 - i;
-    }
-    ctx->free_count = ctx->config.max_elements;
+    stygian_reset_element_pool(ctx);
     ctx->skip_frame = false;
   } else if (has_dirty_overlay_scopes) {
     // Overlay-only dirty frame: start replay from slot 0 so clean non-overlay
@@ -1624,10 +1788,7 @@ void stygian_begin_frame_intent(StygianContext *ctx, int width, int height,
     ctx->element_count = 0;
     ctx->transient_start = 0;
     ctx->transient_count = 0;
-    for (uint32_t i = 0; i < ctx->config.max_elements; i++) {
-      ctx->free_list[i] = ctx->config.max_elements - 1 - i;
-    }
-    ctx->free_count = ctx->config.max_elements;
+    stygian_reset_element_pool(ctx);
     ctx->skip_frame = false;
   } else if (repaint_due) {
     // Timer/forced repaint with clean scopes still starts replay from slot 0;
@@ -1635,10 +1796,7 @@ void stygian_begin_frame_intent(StygianContext *ctx, int width, int height,
     ctx->element_count = 0;
     ctx->transient_start = 0;
     ctx->transient_count = 0;
-    for (uint32_t i = 0; i < ctx->config.max_elements; i++) {
-      ctx->free_list[i] = ctx->config.max_elements - 1 - i;
-    }
-    ctx->free_count = ctx->config.max_elements;
+    stygian_reset_element_pool(ctx);
     ctx->skip_frame = false;
   } else {
     // Fully clean frame: preserve cached data and skip GPU work.
@@ -2168,6 +2326,18 @@ uint32_t stygian_get_total_command_drops(const StygianContext *ctx) {
   return ctx ? ctx->total_command_drops : 0u;
 }
 
+bool stygian_element_is_valid(const StygianContext *ctx, StygianElement e) {
+  return stygian_resolve_element_slot(ctx, e, NULL);
+}
+
+bool stygian_texture_is_valid(const StygianContext *ctx, StygianTexture tex) {
+  return stygian_resolve_texture_slot(ctx, tex, NULL, NULL);
+}
+
+bool stygian_font_is_valid(const StygianContext *ctx, StygianFont font) {
+  return stygian_resolve_font_slot(ctx, font, NULL);
+}
+
 bool stygian_scope_get_last_dirty_info(const StygianContext *ctx,
                                        StygianScopeId id, uint32_t *out_reason,
                                        uint32_t *out_source_tag,
@@ -2230,6 +2400,7 @@ uint32_t stygian_context_get_error_drop_count(const StygianContext *ctx) {
 // ============================================================================
 
 StygianElement stygian_element(StygianContext *ctx) {
+  uint32_t id;
   if (!ctx)
     return 0;
 
@@ -2240,13 +2411,14 @@ StygianElement stygian_element(StygianContext *ctx) {
       }
       return 0;
     }
-    return (StygianElement)(ctx->scope_replay_cursor++ + 1u);
+    id = ctx->scope_replay_cursor++;
+    return (StygianElement)stygian_make_handle(id, ctx->element_generations[id]);
   }
 
   if (ctx->free_count == 0)
     return 0;
 
-  uint32_t id = ctx->free_list[--ctx->free_count];
+  id = ctx->free_list[--ctx->free_count];
 
   // Initialize SoA (zero-fill cold, set hot defaults)
   memset(&ctx->soa.hot[id], 0, sizeof(StygianSoAHot));
@@ -2273,14 +2445,15 @@ StygianElement stygian_element(StygianContext *ctx) {
     ctx->soa.element_count = id + 1;
   }
 
-  return id + 1; // Handle is 1-based
+  return (StygianElement)stygian_make_handle(id, ctx->element_generations[id]);
 }
 
 StygianElement stygian_element_transient(StygianContext *ctx) {
+  uint32_t id;
   StygianElement e = stygian_element(ctx);
   if (e) {
-
-    ctx->soa.hot[e - 1].flags |= STYGIAN_FLAG_TRANSIENT;
+    if (stygian_resolve_element_slot(ctx, e, &id))
+      ctx->soa.hot[id].flags |= STYGIAN_FLAG_TRANSIENT;
     ctx->transient_count++;
   }
   return e;
@@ -2298,7 +2471,8 @@ uint32_t stygian_element_batch(StygianContext *ctx, uint32_t count,
                          : 0u;
     uint32_t n = count < avail ? count : avail;
     for (uint32_t i = 0; i < n; i++) {
-      out_ids[i] = (StygianElement)(ctx->scope_replay_cursor++ + 1u);
+      uint32_t id = ctx->scope_replay_cursor++;
+      out_ids[i] = (StygianElement)stygian_make_handle(id, ctx->element_generations[id]);
     }
     if (n < count && ctx->active_scope_index >= 0) {
       ctx->scope_cache[ctx->active_scope_index].dirty = true;
@@ -2323,7 +2497,7 @@ uint32_t stygian_element_batch(StygianContext *ctx, uint32_t count,
 
   for (uint32_t i = 0; i < n; i++) {
     uint32_t id = ctx->free_list[--ctx->free_count];
-    out_ids[i] = id + 1; // 1-based handle
+    out_ids[i] = (StygianElement)stygian_make_handle(id, ctx->element_generations[id]);
 
     // SoA init
     memset(&ctx->soa.hot[id], 0, sizeof(StygianSoAHot));
@@ -2350,19 +2524,15 @@ uint32_t stygian_element_batch(StygianContext *ctx, uint32_t count,
 }
 
 void stygian_element_free(StygianContext *ctx, StygianElement e) {
-  if (!ctx || e == 0)
+  uint32_t id;
+  if (!ctx)
     return;
-
-  uint32_t id = e - 1;
-  if (id >= ctx->config.max_elements)
-    return;
-
-  uint32_t flags = ctx->soa.hot[id].flags;
-  if (!(flags & STYGIAN_FLAG_ALLOCATED))
+  if (!stygian_resolve_element_slot(ctx, e, &id))
     return;
 
   ctx->soa.hot[id].flags = 0;
   stygian_mark_soa_hot_dirty(ctx, id);
+  ctx->element_generations[id] = stygian_bump_generation(ctx->element_generations[id]);
   ctx->free_list[ctx->free_count++] = id;
 }
 
@@ -2372,10 +2542,8 @@ void stygian_element_free(StygianContext *ctx, StygianElement e) {
 
 void stygian_set_bounds(StygianContext *ctx, StygianElement e, float x, float y,
                         float w, float h) {
-  if (!ctx || e == 0)
-    return;
-  uint32_t id = e - 1;
-  if (id >= ctx->element_count)
+  uint32_t id;
+  if (!stygian_resolve_element_slot(ctx, e, &id))
     return;
 
   // SoA write
@@ -2389,10 +2557,8 @@ void stygian_set_bounds(StygianContext *ctx, StygianElement e, float x, float y,
 
 void stygian_set_color(StygianContext *ctx, StygianElement e, float r, float g,
                        float b, float a) {
-  if (!ctx || e == 0)
-    return;
-  uint32_t id = e - 1;
-  if (id >= ctx->element_count)
+  uint32_t id;
+  if (!stygian_resolve_element_slot(ctx, e, &id))
     return;
 
   // SoA write
@@ -2406,10 +2572,8 @@ void stygian_set_color(StygianContext *ctx, StygianElement e, float r, float g,
 
 void stygian_set_border(StygianContext *ctx, StygianElement e, float r, float g,
                         float b, float a) {
-  if (!ctx || e == 0)
-    return;
-  uint32_t id = e - 1;
-  if (id >= ctx->element_count)
+  uint32_t id;
+  if (!stygian_resolve_element_slot(ctx, e, &id))
     return;
 
   // SoA write
@@ -2426,10 +2590,8 @@ void stygian_set_border(StygianContext *ctx, StygianElement e, float r, float g,
 
 void stygian_set_radius(StygianContext *ctx, StygianElement e, float tl,
                         float tr, float br, float bl) {
-  if (!ctx || e == 0)
-    return;
-  uint32_t id = e - 1;
-  if (id >= ctx->element_count)
+  uint32_t id;
+  if (!stygian_resolve_element_slot(ctx, e, &id))
     return;
 
   // SoA write
@@ -2441,10 +2603,8 @@ void stygian_set_radius(StygianContext *ctx, StygianElement e, float tl,
 }
 
 void stygian_set_type(StygianContext *ctx, StygianElement e, StygianType type) {
-  if (!ctx || e == 0)
-    return;
-  uint32_t id = e - 1;
-  if (id >= ctx->element_count)
+  uint32_t id;
+  if (!stygian_resolve_element_slot(ctx, e, &id))
     return;
 
   // SoA write: preserve render_mode bits in upper 16
@@ -2454,10 +2614,8 @@ void stygian_set_type(StygianContext *ctx, StygianElement e, StygianType type) {
 }
 
 void stygian_set_visible(StygianContext *ctx, StygianElement e, bool visible) {
-  if (!ctx || e == 0)
-    return;
-  uint32_t id = e - 1;
-  if (id >= ctx->element_count)
+  uint32_t id;
+  if (!stygian_resolve_element_slot(ctx, e, &id))
     return;
 
   // SoA write
@@ -2469,10 +2627,8 @@ void stygian_set_visible(StygianContext *ctx, StygianElement e, bool visible) {
 }
 
 void stygian_set_z(StygianContext *ctx, StygianElement e, float z) {
-  if (!ctx || e == 0)
-    return;
-  uint32_t id = e - 1;
-  if (id >= ctx->element_count)
+  uint32_t id;
+  if (!stygian_resolve_element_slot(ctx, e, &id))
     return;
 
   // SoA write
@@ -2483,14 +2639,14 @@ void stygian_set_z(StygianContext *ctx, StygianElement e, float z) {
 void stygian_set_texture(StygianContext *ctx, StygianElement e,
                          StygianTexture tex, float u0, float v0, float u1,
                          float v1) {
-  if (!ctx || e == 0)
+  uint32_t id;
+  uint32_t backend_tex = 0u;
+  if (!stygian_resolve_element_slot(ctx, e, &id))
     return;
-  uint32_t id = e - 1;
-  if (id >= ctx->element_count)
+  if (tex != 0u && !stygian_resolve_texture_slot(ctx, tex, NULL, &backend_tex))
     return;
 
-  // SoA write: texture_id → hot, uv → appearance
-  ctx->soa.hot[id].texture_id = tex;
+  ctx->soa.hot[id].texture_id = backend_tex;
   stygian_mark_soa_hot_dirty(ctx, id);
   ctx->soa.appearance[id].uv[0] = u0;
   ctx->soa.appearance[id].uv[1] = v0;
@@ -2502,10 +2658,8 @@ void stygian_set_texture(StygianContext *ctx, StygianElement e,
 void stygian_set_shadow(StygianContext *ctx, StygianElement e, float offset_x,
                         float offset_y, float blur, float spread, float r,
                         float g, float b, float a) {
-  if (!ctx || e == 0)
-    return;
-  uint32_t id = e - 1;
-  if (id >= ctx->element_count)
+  uint32_t id;
+  if (!stygian_resolve_element_slot(ctx, e, &id))
     return;
 
   // SoA write
@@ -2527,10 +2681,8 @@ void stygian_set_shadow(StygianContext *ctx, StygianElement e, float offset_x,
 void stygian_set_gradient(StygianContext *ctx, StygianElement e, float angle,
                           float r1, float g1, float b1, float a1, float r2,
                           float g2, float b2, float a2) {
-  if (!ctx || e == 0)
-    return;
-  uint32_t id = e - 1;
-  if (id >= ctx->element_count)
+  uint32_t id;
+  if (!stygian_resolve_element_slot(ctx, e, &id))
     return;
 
   // SoA write
@@ -2551,10 +2703,8 @@ void stygian_set_gradient(StygianContext *ctx, StygianElement e, float angle,
 }
 
 void stygian_set_hover(StygianContext *ctx, StygianElement e, float hover) {
-  if (!ctx || e == 0)
-    return;
-  uint32_t id = e - 1;
-  if (id >= ctx->element_count)
+  uint32_t id;
+  if (!stygian_resolve_element_slot(ctx, e, &id))
     return;
 
   // SoA write
@@ -2563,10 +2713,8 @@ void stygian_set_hover(StygianContext *ctx, StygianElement e, float hover) {
 }
 
 void stygian_set_blend(StygianContext *ctx, StygianElement e, float blend) {
-  if (!ctx || e == 0)
-    return;
-  uint32_t id = e - 1;
-  if (id >= ctx->element_count)
+  uint32_t id;
+  if (!stygian_resolve_element_slot(ctx, e, &id))
     return;
 
   // SoA write
@@ -2575,10 +2723,8 @@ void stygian_set_blend(StygianContext *ctx, StygianElement e, float blend) {
 }
 
 void stygian_set_blur(StygianContext *ctx, StygianElement e, float radius) {
-  if (!ctx || e == 0)
-    return;
-  uint32_t id = e - 1;
-  if (id >= ctx->element_count)
+  uint32_t id;
+  if (!stygian_resolve_element_slot(ctx, e, &id))
     return;
 
   // SoA write
@@ -2587,10 +2733,8 @@ void stygian_set_blur(StygianContext *ctx, StygianElement e, float radius) {
 }
 
 void stygian_set_glow(StygianContext *ctx, StygianElement e, float intensity) {
-  if (!ctx || e == 0)
-    return;
-  uint32_t id = e - 1;
-  if (id >= ctx->element_count)
+  uint32_t id;
+  if (!stygian_resolve_element_slot(ctx, e, &id))
     return;
 
   // SoA write
@@ -2723,11 +2867,25 @@ bool stygian_cmd_submit(StygianContext *ctx, StygianCmdBuffer *buffer) {
   return true;
 }
 
+static bool stygian_cmd_init_record(StygianCmdBuffer *buffer,
+                                    StygianElement element,
+                                    StygianCmdRecord *record) {
+  uint32_t id;
+  if (!buffer || !record || !buffer->ctx)
+    return false;
+  if (!stygian_resolve_element_slot(buffer->ctx, element, &id))
+    return false;
+  memset(record, 0, sizeof(*record));
+  record->element_id = id;
+  record->element_handle = (uint32_t)element;
+  return true;
+}
+
 bool stygian_cmd_set_bounds(StygianCmdBuffer *buffer, StygianElement element,
                             float x, float y, float w, float h) {
   StygianCmdRecord record;
-  memset(&record, 0, sizeof(record));
-  record.element_id = element ? (uint32_t)(element - 1u) : UINT32_MAX;
+  if (!stygian_cmd_init_record(buffer, element, &record))
+    return false;
   record.property_id = STYGIAN_CMD_PROP_BOUNDS;
   record.payload.bounds.x = x;
   record.payload.bounds.y = y;
@@ -2739,8 +2897,8 @@ bool stygian_cmd_set_bounds(StygianCmdBuffer *buffer, StygianElement element,
 bool stygian_cmd_set_color(StygianCmdBuffer *buffer, StygianElement element,
                            float r, float g, float b, float a) {
   StygianCmdRecord record;
-  memset(&record, 0, sizeof(record));
-  record.element_id = element ? (uint32_t)(element - 1u) : UINT32_MAX;
+  if (!stygian_cmd_init_record(buffer, element, &record))
+    return false;
   record.property_id = STYGIAN_CMD_PROP_COLOR;
   record.payload.color.r = r;
   record.payload.color.g = g;
@@ -2752,8 +2910,8 @@ bool stygian_cmd_set_color(StygianCmdBuffer *buffer, StygianElement element,
 bool stygian_cmd_set_border(StygianCmdBuffer *buffer, StygianElement element,
                             float r, float g, float b, float a) {
   StygianCmdRecord record;
-  memset(&record, 0, sizeof(record));
-  record.element_id = element ? (uint32_t)(element - 1u) : UINT32_MAX;
+  if (!stygian_cmd_init_record(buffer, element, &record))
+    return false;
   record.property_id = STYGIAN_CMD_PROP_BORDER;
   record.payload.color.r = r;
   record.payload.color.g = g;
@@ -2765,8 +2923,8 @@ bool stygian_cmd_set_border(StygianCmdBuffer *buffer, StygianElement element,
 bool stygian_cmd_set_radius(StygianCmdBuffer *buffer, StygianElement element,
                             float tl, float tr, float br, float bl) {
   StygianCmdRecord record;
-  memset(&record, 0, sizeof(record));
-  record.element_id = element ? (uint32_t)(element - 1u) : UINT32_MAX;
+  if (!stygian_cmd_init_record(buffer, element, &record))
+    return false;
   record.property_id = STYGIAN_CMD_PROP_RADIUS;
   record.payload.radius.tl = tl;
   record.payload.radius.tr = tr;
@@ -2778,8 +2936,8 @@ bool stygian_cmd_set_radius(StygianCmdBuffer *buffer, StygianElement element,
 bool stygian_cmd_set_type(StygianCmdBuffer *buffer, StygianElement element,
                           StygianType type) {
   StygianCmdRecord record;
-  memset(&record, 0, sizeof(record));
-  record.element_id = element ? (uint32_t)(element - 1u) : UINT32_MAX;
+  if (!stygian_cmd_init_record(buffer, element, &record))
+    return false;
   record.property_id = STYGIAN_CMD_PROP_TYPE;
   record.payload.type.type = (uint32_t)type;
   return stygian_cmd_append_record(buffer, &record);
@@ -2788,8 +2946,8 @@ bool stygian_cmd_set_type(StygianCmdBuffer *buffer, StygianElement element,
 bool stygian_cmd_set_visible(StygianCmdBuffer *buffer, StygianElement element,
                              bool visible) {
   StygianCmdRecord record;
-  memset(&record, 0, sizeof(record));
-  record.element_id = element ? (uint32_t)(element - 1u) : UINT32_MAX;
+  if (!stygian_cmd_init_record(buffer, element, &record))
+    return false;
   record.property_id = STYGIAN_CMD_PROP_VISIBLE;
   record.payload.visible.visible = visible ? 1u : 0u;
   return stygian_cmd_append_record(buffer, &record);
@@ -2798,8 +2956,8 @@ bool stygian_cmd_set_visible(StygianCmdBuffer *buffer, StygianElement element,
 bool stygian_cmd_set_z(StygianCmdBuffer *buffer, StygianElement element,
                        float z) {
   StygianCmdRecord record;
-  memset(&record, 0, sizeof(record));
-  record.element_id = element ? (uint32_t)(element - 1u) : UINT32_MAX;
+  if (!stygian_cmd_init_record(buffer, element, &record))
+    return false;
   record.property_id = STYGIAN_CMD_PROP_Z;
   record.payload.depth.z = z;
   return stygian_cmd_append_record(buffer, &record);
@@ -2809,8 +2967,10 @@ bool stygian_cmd_set_texture(StygianCmdBuffer *buffer, StygianElement element,
                              StygianTexture texture, float u0, float v0,
                              float u1, float v1) {
   StygianCmdRecord record;
-  memset(&record, 0, sizeof(record));
-  record.element_id = element ? (uint32_t)(element - 1u) : UINT32_MAX;
+  if (!stygian_cmd_init_record(buffer, element, &record))
+    return false;
+  if (texture != 0u && !stygian_resolve_texture_slot(buffer->ctx, texture, NULL, NULL))
+    return false;
   record.property_id = STYGIAN_CMD_PROP_TEXTURE;
   record.payload.texture.texture = (uint32_t)texture;
   record.payload.texture.u0 = u0;
@@ -2824,8 +2984,8 @@ bool stygian_cmd_set_shadow(StygianCmdBuffer *buffer, StygianElement element,
                             float offset_x, float offset_y, float blur,
                             float spread, float r, float g, float b, float a) {
   StygianCmdRecord record;
-  memset(&record, 0, sizeof(record));
-  record.element_id = element ? (uint32_t)(element - 1u) : UINT32_MAX;
+  if (!stygian_cmd_init_record(buffer, element, &record))
+    return false;
   record.property_id = STYGIAN_CMD_PROP_SHADOW;
   record.payload.shadow.offset_x = offset_x;
   record.payload.shadow.offset_y = offset_y;
@@ -2843,8 +3003,8 @@ bool stygian_cmd_set_gradient(StygianCmdBuffer *buffer, StygianElement element,
                               float a1, float r2, float g2, float b2,
                               float a2) {
   StygianCmdRecord record;
-  memset(&record, 0, sizeof(record));
-  record.element_id = element ? (uint32_t)(element - 1u) : UINT32_MAX;
+  if (!stygian_cmd_init_record(buffer, element, &record))
+    return false;
   record.property_id = STYGIAN_CMD_PROP_GRADIENT;
   record.payload.gradient.angle = angle;
   record.payload.gradient.r1 = r1;
@@ -2861,8 +3021,8 @@ bool stygian_cmd_set_gradient(StygianCmdBuffer *buffer, StygianElement element,
 bool stygian_cmd_set_hover(StygianCmdBuffer *buffer, StygianElement element,
                            float hover) {
   StygianCmdRecord record;
-  memset(&record, 0, sizeof(record));
-  record.element_id = element ? (uint32_t)(element - 1u) : UINT32_MAX;
+  if (!stygian_cmd_init_record(buffer, element, &record))
+    return false;
   record.property_id = STYGIAN_CMD_PROP_HOVER;
   record.payload.scalar.value = hover;
   return stygian_cmd_append_record(buffer, &record);
@@ -2871,8 +3031,8 @@ bool stygian_cmd_set_hover(StygianCmdBuffer *buffer, StygianElement element,
 bool stygian_cmd_set_blend(StygianCmdBuffer *buffer, StygianElement element,
                            float blend) {
   StygianCmdRecord record;
-  memset(&record, 0, sizeof(record));
-  record.element_id = element ? (uint32_t)(element - 1u) : UINT32_MAX;
+  if (!stygian_cmd_init_record(buffer, element, &record))
+    return false;
   record.property_id = STYGIAN_CMD_PROP_BLEND;
   record.payload.scalar.value = blend;
   return stygian_cmd_append_record(buffer, &record);
@@ -2881,8 +3041,8 @@ bool stygian_cmd_set_blend(StygianCmdBuffer *buffer, StygianElement element,
 bool stygian_cmd_set_blur(StygianCmdBuffer *buffer, StygianElement element,
                           float blur_radius) {
   StygianCmdRecord record;
-  memset(&record, 0, sizeof(record));
-  record.element_id = element ? (uint32_t)(element - 1u) : UINT32_MAX;
+  if (!stygian_cmd_init_record(buffer, element, &record))
+    return false;
   record.property_id = STYGIAN_CMD_PROP_BLUR;
   record.payload.scalar.value = blur_radius;
   return stygian_cmd_append_record(buffer, &record);
@@ -2891,18 +3051,16 @@ bool stygian_cmd_set_blur(StygianCmdBuffer *buffer, StygianElement element,
 bool stygian_cmd_set_glow(StygianCmdBuffer *buffer, StygianElement element,
                           float intensity) {
   StygianCmdRecord record;
-  memset(&record, 0, sizeof(record));
-  record.element_id = element ? (uint32_t)(element - 1u) : UINT32_MAX;
+  if (!stygian_cmd_init_record(buffer, element, &record))
+    return false;
   record.property_id = STYGIAN_CMD_PROP_GLOW;
   record.payload.scalar.value = intensity;
   return stygian_cmd_append_record(buffer, &record);
 }
 
 void stygian_set_clip(StygianContext *ctx, StygianElement e, uint8_t clip_id) {
-  if (!ctx || e == 0)
-    return;
-  uint32_t id = e - 1;
-  if (id >= ctx->element_count)
+  uint32_t id;
+  if (!stygian_resolve_element_slot(ctx, e, &id))
     return;
 
   if (clip_id >= ctx->clip_count) {
@@ -3054,10 +3212,13 @@ void stygian_rect_rounded(StygianContext *ctx, float x, float y, float w,
                           float h, float r, float g, float b, float a,
                           float radius) {
   StygianElement e = stygian_element(ctx);
+  uint32_t id;
   if (!e)
     return;
 
-  ctx->soa.hot[e - 1].flags |= STYGIAN_FLAG_TRANSIENT;
+  if (!stygian_resolve_element_slot(ctx, e, &id))
+    return;
+  ctx->soa.hot[id].flags |= STYGIAN_FLAG_TRANSIENT;
   ctx->transient_count++;
 
   stygian_set_bounds(ctx, e, x, y, w, h);
@@ -3070,10 +3231,13 @@ void stygian_rect_rounded(StygianContext *ctx, float x, float y, float w,
 void stygian_line(StygianContext *ctx, float x1, float y1, float x2, float y2,
                   float thickness, float r, float g, float b, float a) {
   StygianElement e = stygian_element(ctx);
+  uint32_t id;
   if (!e)
     return;
 
-  ctx->soa.hot[e - 1].flags |= STYGIAN_FLAG_TRANSIENT;
+  if (!stygian_resolve_element_slot(ctx, e, &id))
+    return;
+  ctx->soa.hot[id].flags |= STYGIAN_FLAG_TRANSIENT;
   ctx->transient_count++;
 
   // Compute bounding box - need large padding so consecutive segments overlap
@@ -3091,7 +3255,6 @@ void stygian_line(StygianContext *ctx, float x1, float y1, float x2, float y2,
   // Encode endpoints in Absolute World Coordinates
   // SoA write: UV → appearance, radius → appearance
   {
-    uint32_t id = e - 1;
     ctx->soa.appearance[id].uv[0] = x1;
     ctx->soa.appearance[id].uv[1] = y1;
     ctx->soa.appearance[id].uv[2] = x2;
@@ -3107,10 +3270,13 @@ void stygian_bezier(StygianContext *ctx, float x1, float y1, float cx, float cy,
                     float x2, float y2, float thickness, float r, float g,
                     float b, float a) {
   StygianElement e = stygian_element(ctx);
+  uint32_t id;
   if (!e)
     return;
 
-  ctx->soa.hot[e - 1].flags |= STYGIAN_FLAG_TRANSIENT;
+  if (!stygian_resolve_element_slot(ctx, e, &id))
+    return;
+  ctx->soa.hot[id].flags |= STYGIAN_FLAG_TRANSIENT;
   ctx->transient_count++;
 
   // Compute bounding box encompassing all control points + padding
@@ -3132,7 +3298,6 @@ void stygian_bezier(StygianContext *ctx, float x1, float y1, float cx, float cy,
   // _reserved[0,1] = control point
   // SoA write
   {
-    uint32_t id = e - 1;
     ctx->soa.appearance[id].uv[0] = x1;
     ctx->soa.appearance[id].uv[1] = y1;
     ctx->soa.appearance[id].uv[2] = x2;
@@ -3153,10 +3318,13 @@ void stygian_wire(StygianContext *ctx, float x1, float y1, float cp1x,
                   float cp1y, float cp2x, float cp2y, float x2, float y2,
                   float thickness, float r, float g, float b, float a) {
   StygianElement e = stygian_element(ctx);
+  uint32_t id;
   if (!e)
     return;
 
-  ctx->soa.hot[e - 1].flags |= STYGIAN_FLAG_TRANSIENT;
+  if (!stygian_resolve_element_slot(ctx, e, &id))
+    return;
+  ctx->soa.hot[id].flags |= STYGIAN_FLAG_TRANSIENT;
   ctx->transient_count++;
 
   // Compute bounding box encompassing all 4 control points + large padding
@@ -3205,7 +3373,6 @@ void stygian_wire(StygianContext *ctx, float x1, float y1, float cp1x,
   // UV: (A, D), _reserved[0,1]: B, _reserved[2,3]: C
   // SoA write
   {
-    uint32_t id = e - 1;
     ctx->soa.appearance[id].uv[0] = x1;
     ctx->soa.appearance[id].uv[1] = y1;
     ctx->soa.appearance[id].uv[2] = x2;
@@ -3222,10 +3389,13 @@ void stygian_wire(StygianContext *ctx, float x1, float y1, float cp1x,
 void stygian_image(StygianContext *ctx, StygianTexture tex, float x, float y,
                    float w, float h) {
   StygianElement e = stygian_element(ctx);
+  uint32_t id;
   if (!e)
     return;
 
-  ctx->soa.hot[e - 1].flags |= STYGIAN_FLAG_TRANSIENT;
+  if (!stygian_resolve_element_slot(ctx, e, &id))
+    return;
+  ctx->soa.hot[id].flags |= STYGIAN_FLAG_TRANSIENT;
   ctx->transient_count++;
 
   stygian_set_bounds(ctx, e, x, y, w, h);
@@ -3238,10 +3408,13 @@ void stygian_image_uv(StygianContext *ctx, StygianTexture tex, float x, float y,
                       float w, float h, float u0, float v0, float u1,
                       float v1) {
   StygianElement e = stygian_element(ctx);
+  uint32_t id;
   if (!e)
     return;
 
-  ctx->soa.hot[e - 1].flags |= STYGIAN_FLAG_TRANSIENT;
+  if (!stygian_resolve_element_slot(ctx, e, &id))
+    return;
+  ctx->soa.hot[id].flags |= STYGIAN_FLAG_TRANSIENT;
   ctx->transient_count++;
 
   stygian_set_bounds(ctx, e, x, y, w, h);
@@ -3283,35 +3456,74 @@ StygianWindow *stygian_get_window(StygianContext *ctx) {
 
 StygianTexture stygian_texture_create(StygianContext *ctx, int w, int h,
                                       const void *rgba) {
+  uint32_t backend_id;
+  uint32_t slot;
   if (!ctx || !ctx->ap)
     return 0;
-  return stygian_ap_texture_create(ctx->ap, w, h, rgba);
+  backend_id = stygian_ap_texture_create(ctx->ap, w, h, rgba);
+  if (backend_id == 0u)
+    return 0u;
+  if (ctx->texture_free_count == 0u) {
+    stygian_ap_texture_destroy(ctx->ap, backend_id);
+    return 0u;
+  }
+  slot = ctx->texture_free_list[--ctx->texture_free_count];
+  ctx->texture_backend_ids[slot] = backend_id;
+  ctx->texture_count++;
+  return (StygianTexture)stygian_make_handle(slot, ctx->texture_generations[slot]);
 }
 
 bool stygian_texture_update(StygianContext *ctx, StygianTexture tex, int x,
                             int y, int w, int h, const void *rgba) {
+  uint32_t backend_id;
   if (!ctx || !ctx->ap || !tex)
     return false;
-  return stygian_ap_texture_update(ctx->ap, tex, x, y, w, h, rgba);
+  if (!stygian_resolve_texture_slot(ctx, tex, NULL, &backend_id))
+    return false;
+  return stygian_ap_texture_update(ctx->ap, backend_id, x, y, w, h, rgba);
 }
 
 void stygian_texture_destroy(StygianContext *ctx, StygianTexture tex) {
+  uint32_t slot;
+  uint32_t backend_id;
   if (!ctx || !ctx->ap || !tex)
     return;
-  stygian_ap_texture_destroy(ctx->ap, tex);
+  if (!stygian_resolve_texture_slot(ctx, tex, &slot, &backend_id))
+    return;
+  stygian_ap_texture_destroy(ctx->ap, backend_id);
+  ctx->texture_backend_ids[slot] = 0u;
+  ctx->texture_generations[slot] =
+      stygian_bump_generation(ctx->texture_generations[slot]);
+  ctx->texture_free_list[ctx->texture_free_count++] = slot;
+  if (ctx->texture_count > 0u)
+    ctx->texture_count--;
 }
 
 // ============================================================================
 // Font API (loads MTSDF atlas via backend)
 // ============================================================================
 
+static StygianFont stygian_first_alive_font(const StygianContext *ctx) {
+  uint32_t i;
+  if (!ctx || !ctx->font_alive || !ctx->font_generations)
+    return 0u;
+  for (i = 0u; i < STYGIAN_MAX_FONTS; i++) {
+    if (ctx->font_alive[i])
+      return (StygianFont)stygian_make_handle(i, ctx->font_generations[i]);
+  }
+  return 0u;
+}
+
 StygianFont stygian_font_load(StygianContext *ctx, const char *atlas_png,
                               const char *atlas_json) {
+  uint32_t font_slot;
+  uint32_t tex_backend_id = 0u;
+  StygianTexture tex_handle = 0u;
+  StygianFontAtlas *font;
   if (!ctx || !atlas_png || !atlas_json)
     return 0;
 
-  // Find free font slot
-  if (ctx->font_count >= 16)
+  if (ctx->font_free_count == 0u)
     return 0;
 
   MTSDFAtlas mtsdf = {0};
@@ -3335,9 +3547,14 @@ StygianFont stygian_font_load(StygianContext *ctx, const char *atlas_png,
   }
 
   // Create texture via backend (proper abstraction!)
-  uint32_t tex_id = stygian_texture_create(ctx, mtsdf.atlas_width,
-                                           mtsdf.atlas_height, mtsdf.pixels);
-  if (!tex_id) {
+  tex_handle = stygian_texture_create(ctx, mtsdf.atlas_width, mtsdf.atlas_height,
+                                      mtsdf.pixels);
+  if (!tex_handle) {
+    mtsdf_free_atlas(&mtsdf);
+    return 0;
+  }
+  if (!stygian_resolve_texture_slot(ctx, tex_handle, NULL, &tex_backend_id)) {
+    stygian_texture_destroy(ctx, tex_handle);
     mtsdf_free_atlas(&mtsdf);
     return 0;
   }
@@ -3349,10 +3566,11 @@ StygianFont stygian_font_load(StygianContext *ctx, const char *atlas_png,
   }
 
   // Store font data
-  uint32_t font_id = ++ctx->font_count;
-  StygianFontAtlas *font = &ctx->fonts[font_id - 1];
-
-  font->texture_id = tex_id;
+  font_slot = ctx->font_free_list[--ctx->font_free_count];
+  font = &ctx->fonts[font_slot];
+  memset(font, 0, sizeof(*font));
+  font->texture_handle = tex_handle;
+  font->texture_backend_id = tex_backend_id;
   font->atlas_width = mtsdf.atlas_width;
   font->atlas_height = mtsdf.atlas_height;
   font->px_range = mtsdf.px_range;
@@ -3387,7 +3605,8 @@ StygianFont stygian_font_load(StygianContext *ctx, const char *atlas_png,
           ctx->allocator, dyn_count, sizeof(StygianFontGlyphEntry),
           _Alignof(StygianFontGlyphEntry), true);
       if (!font->glyph_entries) {
-        stygian_texture_destroy(ctx, tex_id);
+        stygian_texture_destroy(ctx, tex_handle);
+        ctx->font_free_list[ctx->font_free_count++] = font_slot;
         mtsdf_free_atlas(&mtsdf);
         return 0;
       }
@@ -3410,8 +3629,10 @@ StygianFont stygian_font_load(StygianContext *ctx, const char *atlas_png,
         }
       }
       if (!stygian_font_rebuild_glyph_hash(ctx, font, font->glyph_count * 2u)) {
-        stygian_texture_destroy(ctx, tex_id);
+        stygian_texture_destroy(ctx, tex_handle);
         stygian_font_free_dynamic(ctx, font);
+        memset(font, 0, sizeof(*font));
+        ctx->font_free_list[ctx->font_free_count++] = font_slot;
         mtsdf_free_atlas(&mtsdf);
         return 0;
       }
@@ -3436,8 +3657,10 @@ StygianFont stygian_font_load(StygianContext *ctx, const char *atlas_png,
         ctx->allocator, (size_t)mtsdf.kerning_count,
         sizeof(StygianFontKernPair), _Alignof(StygianFontKernPair), true);
     if (!font->kerning_pairs) {
-      stygian_texture_destroy(ctx, tex_id);
+      stygian_texture_destroy(ctx, tex_handle);
       stygian_font_free_dynamic(ctx, font);
+      memset(font, 0, sizeof(*font));
+      ctx->font_free_list[ctx->font_free_count++] = font_slot;
       mtsdf_free_atlas(&mtsdf);
       return 0;
     }
@@ -3450,22 +3673,36 @@ StygianFont stygian_font_load(StygianContext *ctx, const char *atlas_png,
   }
 
   // Bind font texture for text rendering
-  stygian_ap_set_font_texture(ctx->ap, tex_id, font->atlas_width,
+  stygian_ap_set_font_texture(ctx->ap, tex_backend_id, font->atlas_width,
                               font->atlas_height, font->px_range);
+  ctx->font_alive[font_slot] = 1u;
+  ctx->font_count++;
 
   mtsdf_free_atlas(&mtsdf);
-  return font_id;
+  return (StygianFont)stygian_make_handle(font_slot,
+                                          ctx->font_generations[font_slot]);
 }
 
 void stygian_font_destroy(StygianContext *ctx, StygianFont font) {
-  if (!ctx || font == 0 || font > ctx->font_count)
+  uint32_t slot;
+  StygianFontAtlas *f;
+  if (!ctx)
     return;
-  StygianFontAtlas *f = &ctx->fonts[font - 1];
-  if (f->texture_id) {
-    stygian_texture_destroy(ctx, f->texture_id);
-    f->texture_id = 0;
+  if (!stygian_resolve_font_slot(ctx, font, &slot))
+    return;
+  f = &ctx->fonts[slot];
+  if (f->texture_handle) {
+    stygian_texture_destroy(ctx, f->texture_handle);
+    f->texture_handle = 0u;
+    f->texture_backend_id = 0u;
   }
   stygian_font_free_dynamic(ctx, f);
+  memset(f, 0, sizeof(*f));
+  ctx->font_alive[slot] = 0u;
+  ctx->font_generations[slot] = stygian_bump_generation(ctx->font_generations[slot]);
+  ctx->font_free_list[ctx->font_free_count++] = slot;
+  if (ctx->font_count > 0u)
+    ctx->font_count--;
 }
 
 // ============================================================================
@@ -3475,18 +3712,17 @@ void stygian_font_destroy(StygianContext *ctx, StygianFont font) {
 StygianElement stygian_text(StygianContext *ctx, StygianFont font,
                             const char *str, float x, float y, float size,
                             float r, float g, float b, float a) {
+  uint32_t font_slot;
+  StygianFontAtlas *f;
   if (!ctx || !str)
     return 0;
 
   if (font == 0) {
-    if (ctx->font_count == 0)
-      return 0;
-    font = 1;
+    font = stygian_first_alive_font(ctx);
   }
-  if (font > ctx->font_count)
+  if (!stygian_resolve_font_slot(ctx, font, &font_slot))
     return 0;
-
-  StygianFontAtlas *f = &ctx->fonts[font - 1];
+  f = &ctx->fonts[font_slot];
   size_t text_len = strlen(str);
   if (text_len == 0)
     return 0;
@@ -3505,7 +3741,9 @@ StygianElement stygian_text(StygianContext *ctx, StygianFont font,
 
   // Mark all batch elements as transient upfront
   for (uint32_t i = 0; i < allocated; i++) {
-    uint32_t id = batch_stack[i] - 1;
+    uint32_t id;
+    if (!stygian_resolve_element_slot(ctx, batch_stack[i], &id))
+      continue;
     // SoA only
     ctx->soa.hot[id].flags |= STYGIAN_FLAG_TRANSIENT;
   }
@@ -3539,13 +3777,18 @@ StygianElement stygian_text(StygianContext *ctx, StygianFont font,
       char emoji_id[128];
       size_t emoji_after = 0;
       uint32_t emoji_tex = 0;
+      uint32_t emoji_backend_tex = 0;
       if (stygian_try_parse_shortcode(str, text_len, cp_start, emoji_id,
                                       sizeof(emoji_id), &emoji_after) &&
           stygian_inline_emoji_resolve_texture(ctx, emoji_id, &emoji_tex) &&
-          emoji_tex != 0u) {
+          emoji_tex != 0u &&
+          stygian_resolve_texture_slot(ctx, emoji_tex, NULL,
+                                       &emoji_backend_tex)) {
         float emoji_px = f->line_height * size;
         StygianElement e = batch_stack[slot++];
-        uint32_t id = e - 1;
+        uint32_t id;
+        if (!stygian_resolve_element_slot(ctx, e, &id))
+          continue;
         if (!first)
           first = e;
 
@@ -3559,7 +3802,7 @@ StygianElement stygian_text(StygianContext *ctx, StygianFont font,
         ctx->soa.hot[id].color[2] = 1.0f;
         ctx->soa.hot[id].color[3] = a;
         ctx->soa.hot[id].type = STYGIAN_TEXTURE;
-        ctx->soa.hot[id].texture_id = emoji_tex;
+        ctx->soa.hot[id].texture_id = emoji_backend_tex;
         stygian_mark_soa_hot_dirty(ctx, id);
 
         ctx->soa.appearance[id].uv[0] = 0.0f;
@@ -3586,7 +3829,9 @@ StygianElement stygian_text(StygianContext *ctx, StygianFont font,
     float offset_y = (f->ascender - glyph->plane_top) * size;
 
     StygianElement e = batch_stack[slot++];
-    uint32_t id = e - 1;
+    uint32_t id;
+    if (!stygian_resolve_element_slot(ctx, e, &id))
+      continue;
     if (!first)
       first = e;
 
@@ -3600,7 +3845,7 @@ StygianElement stygian_text(StygianContext *ctx, StygianFont font,
     ctx->soa.hot[id].color[2] = b;
     ctx->soa.hot[id].color[3] = a;
     ctx->soa.hot[id].type = STYGIAN_TEXT;
-    ctx->soa.hot[id].texture_id = f->texture_id;
+    ctx->soa.hot[id].texture_id = f->texture_backend_id;
     stygian_mark_soa_hot_dirty(ctx, id);
 
     // Direct SoA fill — appearance (glyph UVs)
@@ -3634,18 +3879,17 @@ StygianElement stygian_text(StygianContext *ctx, StygianFont font,
 
 float stygian_text_width(StygianContext *ctx, StygianFont font, const char *str,
                          float size) {
+  uint32_t font_slot;
+  StygianFontAtlas *f;
   if (!ctx || !str)
     return 0;
 
   if (font == 0) {
-    if (ctx->font_count == 0)
-      return 0;
-    font = 1;
+    font = stygian_first_alive_font(ctx);
   }
-  if (font > ctx->font_count)
+  if (!stygian_resolve_font_slot(ctx, font, &font_slot))
     return 0;
-
-  StygianFontAtlas *f = &ctx->fonts[font - 1];
+  f = &ctx->fonts[font_slot];
   float width = 0.0f;
   float line_width = 0.0f;
   size_t text_len = strlen(str);

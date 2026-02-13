@@ -77,6 +77,7 @@ typedef struct StygianTriadRuntime StygianTriadRuntime;
 // ============================================================================
 
 #define STYGIAN_INLINE_EMOJI_CACHE_SIZE 512
+#define STYGIAN_MAX_FONTS 16u
 
 // ============================================================================
 // Element Flags
@@ -161,6 +162,7 @@ typedef struct StygianCmdRecord {
   uint32_t source_tag;
   uint32_t cmd_index;
   uint32_t element_id;
+  uint32_t element_handle;
   // Property-level merge keeps unrelated fields from clobbering each other.
   uint16_t property_id;
   // Lower value applies first; later keys win for deterministic last-write-wins.
@@ -245,7 +247,8 @@ typedef struct StygianWinnerRecord {
 // ============================================================================
 
 typedef struct StygianFontAtlas {
-  uint32_t texture_id;
+  StygianTexture texture_handle;
+  uint32_t texture_backend_id;
   int atlas_width, atlas_height;
   float px_range;
   float em_size;
@@ -377,6 +380,14 @@ struct StygianContext {
   // ID Reuse
   uint32_t *free_list;
   uint32_t free_count;
+  uint16_t *element_generations;
+
+  // Texture slot map (public handle -> backend texture id)
+  uint32_t *texture_free_list;
+  uint32_t texture_free_count;
+  uint16_t *texture_generations;
+  uint32_t *texture_backend_ids;
+  uint32_t texture_count;
 
   // SoA element storage (Hot/Cold split — 3 SSBOs)
   StygianSoA soa;
@@ -397,6 +408,10 @@ struct StygianContext {
 
   // Fonts
   StygianFontAtlas *fonts;
+  uint32_t *font_free_list;
+  uint32_t font_free_count;
+  uint16_t *font_generations;
+  uint8_t *font_alive;
   uint32_t font_count;
 
   StygianInlineEmojiCacheEntry
