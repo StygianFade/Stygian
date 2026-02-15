@@ -226,4 +226,10 @@ CI workflow:
 
 ## License
 
-MIT
+- Source code: MIT (`LICENSE`).
+- Emoji SGC assets under `assets/sgc/` include third-party licensed artwork.
+- Third-party notices and bundled licenses:
+  - `assets/sgc/THIRD_PARTY_NOTICES.md`
+  - `assets/sgc/LICENSE_OPENMOJI_CC-BY-SA-4.0.txt`
+  - `assets/sgc/LICENSE_TWEMOJI_GRAPHICS_CC-BY-4.0.txt`
+  - `assets/sgc/LICENSE_NOTO_EMOJI_OFL-1.1.txt`
