@@ -88,8 +88,50 @@ int main(void) {
 3. Custom titlebar window:
    - `compile\windows\build_quickwindow_custom_titlebar.bat`
    - `build\quickwindow_custom_titlebar.exe`
-4. Build all quick smoke tests at once:
+4. Custom titlebar window (Vulkan):
+   - `compile\windows\build_quickwindow_custom_titlebar_vk.bat`
+   - `build\quickwindow_custom_titlebar_vk.exe`
+5. Build all quick smoke tests at once:
    - `compile\windows\build_quick_smoke.bat`
+
+## Windows Borderless Maximize Behavior
+
+Borderless maximize on Windows is work-area maximize (taskbar remains visible),
+not true fullscreen.
+
+If you want fullscreen-style monitor coverage, that is a different mode and not
+the default maximize behavior.
+
+On Windows, OpenGL borderless main windows keep strict `WS_POPUP` semantics
+with manual maximize/restore sizing in the core Win32 backend (`window/platform/stygian_win32.c`).
+
+Vulkan borderless path remains unchanged in this iteration.
+
+`quickwindow_custom_titlebar` uses an event-paced loop to avoid maximize hitch
+behavior in unstable OpenGL vsync environments.
+
+## Custom Titlebar API (Win32-first)
+
+Custom titlebar behavior is now exposed through core window APIs:
+
+- `stygian_window_get_titlebar_hints`
+- `stygian_window_set_titlebar_behavior`
+- `stygian_window_begin_system_move`
+- `stygian_window_titlebar_double_click`
+- `stygian_window_get_titlebar_menu_actions`
+- `stygian_window_apply_titlebar_menu_action`
+- `stygian_window_set_fullscreen` / `stygian_window_is_fullscreen`
+
+Defaults:
+
+- Double-click on titlebar toggles maximize/restore.
+- Hover-menu behavior can be enabled/disabled per window via `StygianTitlebarBehavior`.
+- Win32 provides native button-order hints (`right`) and snap/fullscreen action presets.
+
+Current platform status:
+
+- Win32: implemented.
+- Linux/macOS backends: API contract is present with deterministic no-crash fallback stubs.
 
 ## Backend Switching Rules (Strict)
 
@@ -135,6 +177,7 @@ Windows convenience wrapper scripts:
 - `compile/windows/build_quickwindow_vk.bat`
 - `compile/windows/build_quickwindow_borderless.bat`
 - `compile/windows/build_quickwindow_custom_titlebar.bat`
+- `compile/windows/build_quickwindow_custom_titlebar_vk.bat`
 - `compile/windows/build_quick_smoke.bat`
 - `compile/windows/build_text_editor_mini.bat`
 - `compile/windows/build_calculator_mini.bat`

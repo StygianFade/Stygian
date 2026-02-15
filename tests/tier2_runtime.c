@@ -3,6 +3,9 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 typedef struct TestEnv {
   StygianWindow *window;
@@ -188,6 +191,311 @@ static void test_transient_cleanup_determinism(TestEnv *env) {
   stygian_end_frame(env->ctx);
 }
 
+#ifdef _WIN32
+static void pump_window_events(StygianWindow *window, int loops, DWORD sleep_ms) {
+  int i;
+  for (i = 0; i < loops; i++) {
+    StygianEvent event;
+    while (stygian_window_poll_event(window, &event)) {
+    }
+    if (sleep_ms > 0)
+      Sleep(sleep_ms);
+  }
+}
+
+static void test_borderless_maximize_uses_work_area(void) {
+  StygianWindowConfig win_cfg = {
+      .width = 520,
+      .height = 340,
+      .title = "stygian_tier2_borderless_maximize",
+      .flags = STYGIAN_WINDOW_OPENGL | STYGIAN_WINDOW_RESIZABLE |
+               STYGIAN_WINDOW_BORDERLESS | STYGIAN_WINDOW_CENTERED,
+  };
+  StygianConfig cfg;
+  StygianWindow *window = NULL;
+  StygianContext *ctx = NULL;
+  bool maximized = false;
+  int i;
+
+  memset(&cfg, 0, sizeof(cfg));
+  window = stygian_window_create(&win_cfg);
+  CHECK(window != NULL, "borderless maximize fixture window created");
+  if (!window)
+    return;
+
+  cfg.backend = STYGIAN_BACKEND_OPENGL;
+  cfg.max_elements = 128;
+  cfg.max_textures = 32;
+  cfg.window = window;
+  ctx = stygian_create(&cfg);
+  CHECK(ctx != NULL, "borderless maximize fixture context created");
+  if (!ctx) {
+    stygian_window_destroy(window);
+    return;
+  }
+
+  stygian_window_maximize(window);
+  for (i = 0; i < 240; i++) {
+    StygianEvent event;
+    while (stygian_window_poll_event(window, &event)) {
+    }
+    if (stygian_window_is_maximized(window)) {
+      maximized = true;
+      break;
+    }
+    Sleep(8);
+  }
+  CHECK(maximized, "borderless maximize reaches maximized state");
+
+  if (maximized) {
+    for (i = 0; i < 120; i++) {
+      StygianEvent event;
+      while (stygian_window_poll_event(window, &event)) {
+      }
+      Sleep(8);
+    }
+
+    HWND hwnd = (HWND)stygian_window_native_handle(window);
+    HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO monitor_info;
+    RECT window_rect;
+    RECT client_rect;
+    POINT client_tl;
+    POINT client_br;
+    LONG_PTR ex_style;
+    bool window_rect_ok = false;
+    bool client_rect_ok = false;
+    bool geometry_ok = false;
+    bool restored = false;
+
+    memset(&monitor_info, 0, sizeof(monitor_info));
+    memset(&window_rect, 0, sizeof(window_rect));
+    memset(&client_rect, 0, sizeof(client_rect));
+    memset(&client_tl, 0, sizeof(client_tl));
+    memset(&client_br, 0, sizeof(client_br));
+    monitor_info.cbSize = sizeof(monitor_info);
+    window_rect_ok = (hwnd != NULL) && (GetWindowRect(hwnd, &window_rect) != 0);
+    if (hwnd != NULL && GetClientRect(hwnd, &client_rect) != 0) {
+      client_tl.x = client_rect.left;
+      client_tl.y = client_rect.top;
+      client_br.x = client_rect.right;
+      client_br.y = client_rect.bottom;
+      client_rect_ok = (ClientToScreen(hwnd, &client_tl) != 0) &&
+                       (ClientToScreen(hwnd, &client_br) != 0);
+    }
+    geometry_ok =
+        (hwnd != NULL) && (monitor != NULL) &&
+        (GetMonitorInfo(monitor, &monitor_info) != 0) &&
+        (window_rect_ok || client_rect_ok);
+    CHECK(geometry_ok, "borderless maximize monitor geometry query succeeds");
+    if (geometry_ok) {
+      bool window_within_work_area =
+          (window_rect.left >= monitor_info.rcWork.left) &&
+          (window_rect.top >= monitor_info.rcWork.top) &&
+          (window_rect.right <= monitor_info.rcWork.right) &&
+          (window_rect.bottom <= monitor_info.rcWork.bottom);
+      bool client_within_work_area =
+          (client_tl.x >= monitor_info.rcWork.left) &&
+          (client_tl.y >= monitor_info.rcWork.top) &&
+          (client_br.x <= monitor_info.rcWork.right) &&
+          (client_br.y <= monitor_info.rcWork.bottom);
+      bool matches_work_area =
+          window_within_work_area || client_within_work_area;
+      CHECK(matches_work_area, "borderless maximize uses monitor work area");
+    }
+
+    ex_style = (hwnd != NULL) ? GetWindowLongPtr(hwnd, GWL_EXSTYLE) : 0;
+    CHECK((ex_style & WS_EX_TOPMOST) == 0,
+          "borderless maximize keeps window non-topmost");
+
+    stygian_window_restore(window);
+    for (i = 0; i < 240; i++) {
+      StygianEvent event;
+      while (stygian_window_poll_event(window, &event)) {
+      }
+      if (!stygian_window_is_maximized(window)) {
+        restored = true;
+        break;
+      }
+      Sleep(8);
+    }
+    CHECK(restored, "borderless restore clears maximized state");
+  }
+
+  stygian_destroy(ctx);
+  stygian_window_destroy(window);
+}
+
+static void test_borderless_style_routing(void) {
+  StygianWindowConfig gl_cfg = {
+      .width = 500,
+      .height = 320,
+      .title = "stygian_tier2_borderless_gl_style",
+      .flags = STYGIAN_WINDOW_OPENGL | STYGIAN_WINDOW_RESIZABLE |
+               STYGIAN_WINDOW_BORDERLESS | STYGIAN_WINDOW_CENTERED,
+      .role = STYGIAN_ROLE_MAIN,
+  };
+  StygianWindowConfig vk_cfg = {
+      .width = 500,
+      .height = 320,
+      .title = "stygian_tier2_borderless_vk_style",
+      .flags = STYGIAN_WINDOW_VULKAN | STYGIAN_WINDOW_RESIZABLE |
+               STYGIAN_WINDOW_BORDERLESS | STYGIAN_WINDOW_CENTERED,
+      .role = STYGIAN_ROLE_MAIN,
+  };
+  StygianWindow *gl_window = stygian_window_create(&gl_cfg);
+  StygianWindow *vk_window = NULL;
+
+  CHECK(gl_window != NULL, "opengl borderless style fixture window created");
+  if (gl_window) {
+    HWND hwnd = (HWND)stygian_window_native_handle(gl_window);
+    LONG_PTR style = (hwnd != NULL) ? GetWindowLongPtr(hwnd, GWL_STYLE) : 0;
+    CHECK((style & WS_POPUP) != 0, "opengl borderless main keeps popup style");
+    stygian_window_destroy(gl_window);
+  }
+
+  vk_window = stygian_window_create(&vk_cfg);
+  CHECK(vk_window != NULL, "vulkan borderless style fixture window created");
+  if (vk_window) {
+    HWND hwnd = (HWND)stygian_window_native_handle(vk_window);
+    LONG_PTR style = (hwnd != NULL) ? GetWindowLongPtr(hwnd, GWL_STYLE) : 0;
+    CHECK((style & WS_POPUP) != 0, "vulkan borderless main keeps popup style");
+    stygian_window_destroy(vk_window);
+  }
+}
+
+static void test_titlebar_behavior_and_actions(void) {
+  StygianWindowConfig cfg = {
+      .width = 640,
+      .height = 420,
+      .title = "stygian_tier2_titlebar_behavior",
+      .flags = STYGIAN_WINDOW_OPENGL | STYGIAN_WINDOW_RESIZABLE |
+               STYGIAN_WINDOW_BORDERLESS | STYGIAN_WINDOW_CENTERED,
+      .role = STYGIAN_ROLE_MAIN,
+  };
+  StygianWindow *window = stygian_window_create(&cfg);
+  StygianTitlebarBehavior behavior = {0};
+  StygianTitlebarHints hints = {0};
+  StygianTitlebarMenuAction actions[16];
+  uint32_t action_count = 0u;
+  bool has_maximize = false;
+  bool has_fullscreen = false;
+  bool has_snap_right = false;
+  bool fullscreen_toggled = false;
+  bool fullscreen_restored = false;
+  bool begin_move_ok = false;
+  bool snap_applied = false;
+
+  CHECK(window != NULL, "titlebar behavior fixture window created");
+  if (!window)
+    return;
+
+  stygian_window_get_titlebar_hints(window, &hints);
+  CHECK(hints.button_order == STYGIAN_TITLEBAR_BUTTONS_RIGHT,
+        "win32 titlebar hints default to right button order");
+  CHECK(hints.supports_hover_menu, "win32 titlebar hints expose hover menu");
+  CHECK(hints.supports_snap_actions, "win32 titlebar hints expose snap actions");
+
+  stygian_window_get_titlebar_behavior(window, &behavior);
+  CHECK(behavior.double_click_mode == STYGIAN_TITLEBAR_DBLCLICK_MAXIMIZE_RESTORE,
+        "titlebar double-click defaults to maximize/restore");
+
+  stygian_window_titlebar_double_click(window);
+  pump_window_events(window, 80, 8);
+  CHECK(stygian_window_is_maximized(window),
+        "titlebar double-click toggles to maximized");
+  stygian_window_titlebar_double_click(window);
+  pump_window_events(window, 80, 8);
+  CHECK(!stygian_window_is_maximized(window),
+        "titlebar double-click toggles restore");
+
+  behavior.double_click_mode = STYGIAN_TITLEBAR_DBLCLICK_FULLSCREEN_TOGGLE;
+  behavior.hover_menu_enabled = true;
+  stygian_window_set_titlebar_behavior(window, &behavior);
+  stygian_window_titlebar_double_click(window);
+  pump_window_events(window, 60, 8);
+  fullscreen_toggled = stygian_window_is_fullscreen(window);
+  CHECK(fullscreen_toggled, "fullscreen policy toggles on double-click");
+  stygian_window_titlebar_double_click(window);
+  pump_window_events(window, 60, 8);
+  fullscreen_restored = !stygian_window_is_fullscreen(window);
+  CHECK(fullscreen_restored, "fullscreen policy toggles back on double-click");
+
+  action_count = stygian_window_get_titlebar_menu_actions(
+      window, actions, (uint32_t)(sizeof(actions) / sizeof(actions[0])));
+  CHECK(action_count >= 8u, "titlebar menu exposes native preset action set");
+  if (action_count > 0u) {
+    uint32_t i;
+    for (i = 0u; i < action_count; i++) {
+      if (actions[i] == STYGIAN_TITLEBAR_ACTION_MAXIMIZE ||
+          actions[i] == STYGIAN_TITLEBAR_ACTION_RESTORE) {
+        has_maximize = true;
+      }
+      if (actions[i] == STYGIAN_TITLEBAR_ACTION_ENTER_FULLSCREEN ||
+          actions[i] == STYGIAN_TITLEBAR_ACTION_EXIT_FULLSCREEN) {
+        has_fullscreen = true;
+      }
+      if (actions[i] == STYGIAN_TITLEBAR_ACTION_SNAP_RIGHT) {
+        has_snap_right = true;
+      }
+    }
+  }
+  CHECK(has_maximize, "titlebar menu includes maximize/restore action");
+  CHECK(has_fullscreen, "titlebar menu includes fullscreen action");
+  CHECK(has_snap_right, "titlebar menu includes snap action");
+
+  snap_applied = stygian_window_apply_titlebar_menu_action(
+      window, STYGIAN_TITLEBAR_ACTION_SNAP_RIGHT);
+  CHECK(snap_applied, "snap-right titlebar action applies");
+  if (snap_applied) {
+    HWND hwnd = (HWND)stygian_window_native_handle(window);
+    HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO monitor_info;
+    RECT rect;
+    bool geometry_ok;
+    bool right_half_ok = false;
+    LONG expected_left;
+
+    memset(&monitor_info, 0, sizeof(monitor_info));
+    monitor_info.cbSize = sizeof(monitor_info);
+    memset(&rect, 0, sizeof(rect));
+    pump_window_events(window, 60, 8);
+    geometry_ok =
+        (hwnd != NULL) && (monitor != NULL) &&
+        (GetMonitorInfo(monitor, &monitor_info) != 0) &&
+        (GetWindowRect(hwnd, &rect) != 0);
+    CHECK(geometry_ok, "snap-right geometry query succeeds");
+    if (geometry_ok) {
+      LONG half_width = (monitor_info.rcWork.right - monitor_info.rcWork.left) / 2;
+      expected_left = monitor_info.rcWork.right - half_width;
+      right_half_ok = (rect.right <= monitor_info.rcWork.right + 1) &&
+                      (rect.right >= monitor_info.rcWork.right - 1) &&
+                      (rect.left >= expected_left - 1) &&
+                      (rect.left <= expected_left + 1);
+      CHECK(right_half_ok, "snap-right aligns to monitor work-area right half");
+    }
+  }
+
+  begin_move_ok = stygian_window_begin_system_move(window);
+  CHECK(begin_move_ok, "begin_system_move returns success on win32");
+  pump_window_events(window, 30, 8);
+
+  stygian_window_destroy(window);
+}
+#else
+static void test_borderless_maximize_uses_work_area(void) {
+  CHECK(true, "borderless maximize work-area check skipped on non-Windows");
+}
+
+static void test_borderless_style_routing(void) {
+  CHECK(true, "borderless style routing check skipped on non-Windows");
+}
+
+static void test_titlebar_behavior_and_actions(void) {
+  CHECK(true, "titlebar behavior checks skipped on non-Windows");
+}
+#endif
+
 int main(void) {
   TestEnv env;
   if (!test_env_init(&env)) {
@@ -199,6 +507,9 @@ int main(void) {
   test_overlay_invalidation_isolated(&env);
   test_clip_runtime_behavior(&env);
   test_transient_cleanup_determinism(&env);
+  test_borderless_maximize_uses_work_area();
+  test_borderless_style_routing();
+  test_titlebar_behavior_and_actions();
 
   test_env_destroy(&env);
 

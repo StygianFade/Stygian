@@ -8,6 +8,7 @@
 #include <dwmapi.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <windows.h>
 #include <windowsx.h>
 #ifdef STYGIAN_VULKAN
@@ -35,6 +36,12 @@ struct StygianWindow {
   bool focused;
   bool maximized;
   bool minimized;
+  bool fullscreen;
+  bool borderless_manual_maximized;
+  bool borderless_restore_valid;
+  RECT borderless_restore_rect;
+  bool fullscreen_restore_valid;
+  RECT fullscreen_restore_rect;
   bool external_owned; // True if wrapped via stygian_window_from_native()
 
   // Event queue (ring buffer)
@@ -51,6 +58,12 @@ struct StygianWindow {
   // Config
   uint32_t flags;
   bool gl_pixel_format_set;
+  bool gl_vsync_requested;
+  bool gl_swap_control_supported;
+  bool gl_borderless_vsync_suspended;
+  bool gl_swap_interval_resync_pending;
+  uint32_t gl_borderless_present_stall_count;
+  StygianTitlebarBehavior titlebar_behavior;
   bool in_size_move;
   UINT_PTR live_tick_timer_id;
   uint32_t live_tick_hz;
@@ -65,6 +78,15 @@ static const uint32_t STYGIAN_WIN32_DEFAULT_LIVE_TICK_HZ = 30u;
 static const int STYGIAN_WIN32_MIN_TRACK_W = 320;
 static const int STYGIAN_WIN32_MIN_TRACK_H = 200;
 static void push_event(StygianWindow *win, StygianEvent *e);
+static bool stygian_win32_get_monitor_work_rect(HWND hwnd, RECT *out_rect);
+static bool stygian_win32_get_monitor_rect(HWND hwnd, RECT *out_rect);
+static bool stygian_win32_get_fullscreen_state(HWND hwnd, RECT *out_rect);
+static void stygian_win32_apply_window_rect(HWND hwnd, const RECT *rect);
+static bool stygian_win32_present_trace_enabled(void);
+static void stygian_win32_trace_transition(StygianWindow *win,
+                                           const char *transition);
+static void stygian_win32_trace_long_present(StygianWindow *win,
+                                             double present_ms);
 
 static void stygian_win32_start_live_ticks(StygianWindow *win, uint32_t hz) {
   UINT interval_ms;
@@ -208,6 +230,115 @@ static bool stygian_win32_use_dwm_flush(void) {
   return enabled;
 }
 
+static bool stygian_win32_present_trace_enabled(void) {
+  static int initialized = 0;
+  static bool enabled = false;
+  if (!initialized) {
+    const char *env = getenv("STYGIAN_GL_PRESENT_TRACE");
+    enabled = (env && env[0] && env[0] != '0');
+    initialized = 1;
+  }
+  return enabled;
+}
+
+static void stygian_win32_trace_transition(StygianWindow *win,
+                                           const char *transition) {
+  if (!win || !win->hwnd || !transition || !stygian_win32_present_trace_enabled())
+    return;
+  printf("[Stygian Win32] %s manual=%d zoomed=%d\n", transition,
+         win->borderless_manual_maximized ? 1 : 0, IsZoomed(win->hwnd) ? 1 : 0);
+}
+
+static void stygian_win32_trace_long_present(StygianWindow *win,
+                                             double present_ms) {
+  if (!win || !win->hwnd || !stygian_win32_present_trace_enabled() ||
+      present_ms <= 50.0) {
+    return;
+  }
+  printf("[Stygian Win32] present %.2fms manual=%d zoomed=%d\n", present_ms,
+         win->borderless_manual_maximized ? 1 : 0, IsZoomed(win->hwnd) ? 1 : 0);
+}
+
+static bool stygian_win32_get_borderless_work_area(HWND hwnd,
+                                                   POINT *out_max_pos,
+                                                   POINT *out_max_size) {
+  RECT work_rect;
+  HMONITOR monitor;
+  MONITORINFO monitor_info;
+  if (!hwnd || !out_max_pos || !out_max_size)
+    return false;
+  if (!stygian_win32_get_monitor_work_rect(hwnd, &work_rect))
+    return false;
+
+  monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+  if (!monitor)
+    return false;
+  memset(&monitor_info, 0, sizeof(monitor_info));
+  monitor_info.cbSize = sizeof(monitor_info);
+  if (!GetMonitorInfo(monitor, &monitor_info))
+    return false;
+
+  out_max_pos->x = work_rect.left - monitor_info.rcMonitor.left;
+  out_max_pos->y = work_rect.top - monitor_info.rcMonitor.top;
+  out_max_size->x = work_rect.right - work_rect.left;
+  out_max_size->y = work_rect.bottom - work_rect.top;
+  return true;
+}
+
+static bool stygian_win32_get_monitor_work_rect(HWND hwnd, RECT *out_rect) {
+  HMONITOR monitor;
+  MONITORINFO monitor_info;
+  if (!hwnd || !out_rect)
+    return false;
+
+  monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+  if (!monitor)
+    return false;
+
+  memset(&monitor_info, 0, sizeof(monitor_info));
+  monitor_info.cbSize = sizeof(monitor_info);
+  if (!GetMonitorInfo(monitor, &monitor_info))
+    return false;
+
+  *out_rect = monitor_info.rcWork;
+  return true;
+}
+
+static bool stygian_win32_get_monitor_rect(HWND hwnd, RECT *out_rect) {
+  HMONITOR monitor;
+  MONITORINFO monitor_info;
+  if (!hwnd || !out_rect)
+    return false;
+
+  monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+  if (!monitor)
+    return false;
+
+  memset(&monitor_info, 0, sizeof(monitor_info));
+  monitor_info.cbSize = sizeof(monitor_info);
+  if (!GetMonitorInfo(monitor, &monitor_info))
+    return false;
+
+  *out_rect = monitor_info.rcMonitor;
+  return true;
+}
+
+static bool stygian_win32_get_fullscreen_state(HWND hwnd, RECT *out_rect) {
+  if (!hwnd || !out_rect)
+    return false;
+  return stygian_win32_get_monitor_rect(hwnd, out_rect);
+}
+
+static void stygian_win32_apply_window_rect(HWND hwnd, const RECT *rect) {
+  if (!hwnd || !rect)
+    return;
+  SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+               SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+  SetWindowPos(hwnd, NULL, rect->left, rect->top, rect->right - rect->left,
+               rect->bottom - rect->top,
+               SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER);
+}
+
 // ============================================================================
 // Key Translation
 // ============================================================================
@@ -325,8 +456,19 @@ static void push_event(StygianWindow *win, StygianEvent *e) {
 static LRESULT CALLBACK win32_wndproc(HWND hwnd, UINT msg, WPARAM wp,
                                       LPARAM lp) {
   StygianWindow *win = (StygianWindow *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
-  if (!win)
+  if (!win) {
+    if (msg == WM_NCCREATE) {
+      const CREATESTRUCT *create_struct = (const CREATESTRUCT *)lp;
+      StygianWindow *create_win =
+          create_struct ? (StygianWindow *)create_struct->lpCreateParams : NULL;
+      if (create_win) {
+        SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)create_win);
+        create_win->hwnd = hwnd;
+        return TRUE;
+      }
+    }
     return DefWindowProc(hwnd, msg, wp, lp);
+  }
 
   StygianEvent e = {0};
 
@@ -340,7 +482,8 @@ static LRESULT CALLBACK win32_wndproc(HWND hwnd, UINT msg, WPARAM wp,
   case WM_SIZE:
     win->width = LOWORD(lp);
     win->height = HIWORD(lp);
-    win->maximized = (wp == SIZE_MAXIMIZED);
+    win->maximized =
+        win->borderless_manual_maximized || (wp == SIZE_MAXIMIZED);
     win->minimized = (wp == SIZE_MINIMIZED);
     e.type = STYGIAN_EVENT_RESIZE;
     e.resize.width = win->width;
@@ -427,6 +570,18 @@ static LRESULT CALLBACK win32_wndproc(HWND hwnd, UINT msg, WPARAM wp,
     SetCapture(hwnd);
     return 0;
 
+  case WM_LBUTTONDBLCLK:
+    e.type = STYGIAN_EVENT_MOUSE_DOWN;
+    e.mouse_button.x = GET_X_LPARAM(lp);
+    e.mouse_button.y = GET_Y_LPARAM(lp);
+    e.mouse_button.button = STYGIAN_MOUSE_LEFT;
+    e.mouse_button.mods = get_mods();
+    e.mouse_button.clicks = 2;
+    win->mouse_buttons[e.mouse_button.button] = true;
+    push_event(win, &e);
+    SetCapture(hwnd);
+    return 0;
+
   case WM_LBUTTONUP:
   case WM_RBUTTONUP:
   case WM_MBUTTONUP:
@@ -490,6 +645,19 @@ static LRESULT CALLBACK win32_wndproc(HWND hwnd, UINT msg, WPARAM wp,
       return 0;
     }
     break;
+
+  case WM_GETMINMAXINFO:
+    if ((win->flags & STYGIAN_WINDOW_BORDERLESS) && lp) {
+      MINMAXINFO *minmax_info = (MINMAXINFO *)lp;
+      POINT max_pos = {0};
+      POINT max_size = {0};
+      if (stygian_win32_get_borderless_work_area(hwnd, &max_pos, &max_size)) {
+        minmax_info->ptMaxPosition = max_pos;
+        minmax_info->ptMaxSize = max_size;
+        return 0;
+      }
+    }
+    break;
   }
 
   return DefWindowProc(hwnd, msg, wp, lp);
@@ -507,7 +675,7 @@ StygianWindow *stygian_window_create(const StygianWindowConfig *config) {
   if (!class_registered) {
     WNDCLASSEX wc = {0};
     wc.cbSize = sizeof(wc);
-    wc.style = CS_HREDRAW | CS_VREDRAW | CS_OWNDC;
+    wc.style = CS_HREDRAW | CS_VREDRAW | CS_OWNDC | CS_DBLCLKS;
     wc.lpfnWndProc = win32_wndproc;
     wc.hInstance = GetModuleHandle(NULL);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
@@ -526,6 +694,9 @@ StygianWindow *stygian_window_create(const StygianWindowConfig *config) {
   win->flags = config->flags;
   win->focused = true;
   win->live_tick_hz = STYGIAN_WIN32_DEFAULT_LIVE_TICK_HZ;
+  win->titlebar_behavior.double_click_mode =
+      STYGIAN_TITLEBAR_DBLCLICK_MAXIMIZE_RESTORE;
+  win->titlebar_behavior.hover_menu_enabled = true;
 
   // Window style
   DWORD style = WS_OVERLAPPEDWINDOW;
@@ -577,7 +748,7 @@ StygianWindow *stygian_window_create(const StygianWindowConfig *config) {
   // Create window
   win->hwnd =
       CreateWindowEx(ex_style, WIN_CLASS, config->title, style, x, y, adj_w,
-                     adj_h, NULL, NULL, GetModuleHandle(NULL), NULL);
+                     adj_h, NULL, NULL, GetModuleHandle(NULL), win);
   if (!win->hwnd) {
     free(win);
     return NULL;
@@ -693,6 +864,20 @@ void stygian_window_get_size(StygianWindow *win, int *w, int *h) {
 
 void stygian_window_set_size(StygianWindow *win, int w, int h) {
   if (win && win->hwnd) {
+    if (win->fullscreen) {
+      win->fullscreen = false;
+      win->fullscreen_restore_valid = false;
+    }
+    if (win->borderless_manual_maximized) {
+      win->borderless_manual_maximized = false;
+      win->maximized = false;
+      win->gl_borderless_vsync_suspended = false;
+      win->gl_borderless_present_stall_count = 0u;
+      if ((win->flags & STYGIAN_WINDOW_OPENGL) && win->gl_vsync_requested &&
+          win->gl_swap_control_supported) {
+        win->gl_swap_interval_resync_pending = true;
+      }
+    }
     SetWindowPos(win->hwnd, NULL, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER);
   }
 }
@@ -710,6 +895,20 @@ void stygian_window_get_position(StygianWindow *win, int *x, int *y) {
 
 void stygian_window_set_position(StygianWindow *win, int x, int y) {
   if (win && win->hwnd) {
+    if (win->fullscreen) {
+      win->fullscreen = false;
+      win->fullscreen_restore_valid = false;
+    }
+    if (win->borderless_manual_maximized) {
+      win->borderless_manual_maximized = false;
+      win->maximized = false;
+      win->gl_borderless_vsync_suspended = false;
+      win->gl_borderless_present_stall_count = 0u;
+      if ((win->flags & STYGIAN_WINDOW_OPENGL) && win->gl_vsync_requested &&
+          win->gl_swap_control_supported) {
+        win->gl_swap_interval_resync_pending = true;
+      }
+    }
     SetWindowPos(win->hwnd, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
   }
 }
@@ -721,18 +920,83 @@ void stygian_window_set_title(StygianWindow *win, const char *title) {
 }
 
 void stygian_window_minimize(StygianWindow *win) {
-  if (win && win->hwnd)
+  if (win && win->hwnd) {
+    if (win->fullscreen) {
+      stygian_window_set_fullscreen(win, false);
+    }
     ShowWindow(win->hwnd, SW_MINIMIZE);
+  }
 }
 
 void stygian_window_maximize(StygianWindow *win) {
-  if (win && win->hwnd)
-    ShowWindow(win->hwnd, SW_MAXIMIZE);
+  if (!win || !win->hwnd)
+    return;
+  if (win->fullscreen) {
+    stygian_window_set_fullscreen(win, false);
+  }
+  stygian_win32_trace_transition(win, "maximize-request");
+  if (win->flags & STYGIAN_WINDOW_BORDERLESS) {
+    RECT work_rect;
+    RECT monitor_rect;
+    if (!win->borderless_manual_maximized &&
+        GetWindowRect(win->hwnd, &win->borderless_restore_rect)) {
+      win->borderless_restore_valid = true;
+    }
+    if (stygian_win32_get_monitor_work_rect(win->hwnd, &work_rect)) {
+      if ((win->flags & STYGIAN_WINDOW_OPENGL) &&
+          stygian_win32_get_monitor_rect(win->hwnd, &monitor_rect)) {
+        bool full_monitor =
+            (work_rect.left == monitor_rect.left) &&
+            (work_rect.top == monitor_rect.top) &&
+            (work_rect.right == monitor_rect.right) &&
+            (work_rect.bottom == monitor_rect.bottom);
+        if (full_monitor && (work_rect.bottom - work_rect.top) > 1) {
+          work_rect.bottom -= 1;
+        }
+      }
+      stygian_win32_apply_window_rect(win->hwnd, &work_rect);
+      win->borderless_manual_maximized = true;
+      win->maximized = true;
+      win->minimized = false;
+      win->gl_borderless_present_stall_count = 0u;
+      if ((win->flags & STYGIAN_WINDOW_OPENGL) && win->gl_vsync_requested &&
+          win->gl_swap_control_supported) {
+        win->gl_borderless_vsync_suspended = false;
+        win->gl_swap_interval_resync_pending = true;
+      }
+      return;
+    }
+  }
+  ShowWindow(win->hwnd, SW_MAXIMIZE);
 }
 
 void stygian_window_restore(StygianWindow *win) {
-  if (win && win->hwnd)
-    ShowWindow(win->hwnd, SW_RESTORE);
+  if (!win || !win->hwnd)
+    return;
+  if (win->fullscreen) {
+    stygian_window_set_fullscreen(win, false);
+    return;
+  }
+  stygian_win32_trace_transition(win, "restore-request");
+  if (win->borderless_manual_maximized) {
+    if (win->borderless_restore_valid) {
+      RECT restore_rect = win->borderless_restore_rect;
+      stygian_win32_apply_window_rect(win->hwnd, &restore_rect);
+    } else {
+      ShowWindow(win->hwnd, SW_RESTORE);
+    }
+    win->borderless_manual_maximized = false;
+    win->maximized = false;
+    win->minimized = false;
+    win->gl_borderless_vsync_suspended = false;
+    win->gl_borderless_present_stall_count = 0u;
+    if ((win->flags & STYGIAN_WINDOW_OPENGL) && win->gl_vsync_requested &&
+        win->gl_swap_control_supported) {
+      win->gl_swap_interval_resync_pending = true;
+    }
+    return;
+  }
+  ShowWindow(win->hwnd, SW_RESTORE);
 }
 
 bool stygian_window_is_maximized(StygianWindow *win) {
@@ -741,6 +1005,249 @@ bool stygian_window_is_maximized(StygianWindow *win) {
 
 bool stygian_window_is_minimized(StygianWindow *win) {
   return win ? win->minimized : false;
+}
+
+void stygian_window_set_fullscreen(StygianWindow *win, bool enabled) {
+  RECT target_rect;
+  if (!win || !win->hwnd)
+    return;
+  if (enabled == win->fullscreen)
+    return;
+
+  if (enabled) {
+    if (!win->fullscreen_restore_valid &&
+        GetWindowRect(win->hwnd, &win->fullscreen_restore_rect)) {
+      win->fullscreen_restore_valid = true;
+    }
+    if (!stygian_win32_get_fullscreen_state(win->hwnd, &target_rect))
+      return;
+    stygian_win32_apply_window_rect(win->hwnd, &target_rect);
+    win->fullscreen = true;
+    win->maximized = false;
+    win->minimized = false;
+    win->borderless_manual_maximized = false;
+    win->gl_borderless_vsync_suspended = false;
+    win->gl_borderless_present_stall_count = 0u;
+    if ((win->flags & STYGIAN_WINDOW_OPENGL) && win->gl_vsync_requested &&
+        win->gl_swap_control_supported) {
+      win->gl_swap_interval_resync_pending = true;
+    }
+    return;
+  }
+
+  if (win->fullscreen_restore_valid) {
+    target_rect = win->fullscreen_restore_rect;
+    stygian_win32_apply_window_rect(win->hwnd, &target_rect);
+  }
+  win->fullscreen = false;
+  win->maximized = false;
+  win->minimized = false;
+  win->gl_borderless_vsync_suspended = false;
+  win->gl_borderless_present_stall_count = 0u;
+  if ((win->flags & STYGIAN_WINDOW_OPENGL) && win->gl_vsync_requested &&
+      win->gl_swap_control_supported) {
+    win->gl_swap_interval_resync_pending = true;
+  }
+}
+
+bool stygian_window_is_fullscreen(StygianWindow *win) {
+  return win ? win->fullscreen : false;
+}
+
+void stygian_window_get_titlebar_hints(StygianWindow *win,
+                                       StygianTitlebarHints *out_hints) {
+  if (!out_hints)
+    return;
+  out_hints->button_order = STYGIAN_TITLEBAR_BUTTONS_RIGHT;
+  out_hints->supports_hover_menu = true;
+  out_hints->supports_snap_actions = true;
+  out_hints->recommended_titlebar_height = 36.0f;
+  out_hints->recommended_button_width = 28.0f;
+  out_hints->recommended_button_height = 24.0f;
+  out_hints->recommended_button_gap = 6.0f;
+  if (win && !win->titlebar_behavior.hover_menu_enabled) {
+    out_hints->supports_hover_menu = false;
+  }
+}
+
+void stygian_window_set_titlebar_behavior(
+    StygianWindow *win, const StygianTitlebarBehavior *behavior) {
+  if (!win || !behavior)
+    return;
+  win->titlebar_behavior = *behavior;
+  if (win->titlebar_behavior.double_click_mode !=
+          STYGIAN_TITLEBAR_DBLCLICK_MAXIMIZE_RESTORE &&
+      win->titlebar_behavior.double_click_mode !=
+          STYGIAN_TITLEBAR_DBLCLICK_FULLSCREEN_TOGGLE) {
+    win->titlebar_behavior.double_click_mode =
+        STYGIAN_TITLEBAR_DBLCLICK_MAXIMIZE_RESTORE;
+  }
+}
+
+void stygian_window_get_titlebar_behavior(StygianWindow *win,
+                                          StygianTitlebarBehavior *out_behavior) {
+  if (!out_behavior)
+    return;
+  out_behavior->double_click_mode = STYGIAN_TITLEBAR_DBLCLICK_MAXIMIZE_RESTORE;
+  out_behavior->hover_menu_enabled = true;
+  if (!win)
+    return;
+  *out_behavior = win->titlebar_behavior;
+}
+
+bool stygian_window_begin_system_move(StygianWindow *win) {
+  if (!win || !win->hwnd || win->fullscreen)
+    return false;
+  ReleaseCapture();
+  return PostMessage(win->hwnd, WM_SYSCOMMAND, SC_MOVE | HTCAPTION, 0) != 0;
+}
+
+void stygian_window_titlebar_double_click(StygianWindow *win) {
+  if (!win)
+    return;
+  if (win->titlebar_behavior.double_click_mode ==
+      STYGIAN_TITLEBAR_DBLCLICK_FULLSCREEN_TOGGLE) {
+    stygian_window_set_fullscreen(win, !stygian_window_is_fullscreen(win));
+    return;
+  }
+  if (stygian_window_is_fullscreen(win)) {
+    stygian_window_set_fullscreen(win, false);
+    return;
+  }
+  if (stygian_window_is_maximized(win)) {
+    stygian_window_restore(win);
+  } else {
+    stygian_window_maximize(win);
+  }
+}
+
+uint32_t stygian_window_get_titlebar_menu_actions(
+    StygianWindow *win, StygianTitlebarMenuAction *out_actions,
+    uint32_t max_actions) {
+  uint32_t count = 0;
+#define STYGIAN_PUSH_TITLEBAR_ACTION(action_value)                              \
+  do {                                                                          \
+    if (out_actions && count < max_actions)                                     \
+      out_actions[count] = (action_value);                                      \
+    count++;                                                                    \
+  } while (0)
+  if (!win)
+    return 0;
+
+  if (stygian_window_is_maximized(win)) {
+    STYGIAN_PUSH_TITLEBAR_ACTION(STYGIAN_TITLEBAR_ACTION_RESTORE);
+  } else {
+    STYGIAN_PUSH_TITLEBAR_ACTION(STYGIAN_TITLEBAR_ACTION_MAXIMIZE);
+  }
+  if (stygian_window_is_fullscreen(win)) {
+    STYGIAN_PUSH_TITLEBAR_ACTION(STYGIAN_TITLEBAR_ACTION_EXIT_FULLSCREEN);
+  } else {
+    STYGIAN_PUSH_TITLEBAR_ACTION(STYGIAN_TITLEBAR_ACTION_ENTER_FULLSCREEN);
+  }
+  if (win->flags & STYGIAN_WINDOW_RESIZABLE) {
+    STYGIAN_PUSH_TITLEBAR_ACTION(STYGIAN_TITLEBAR_ACTION_SNAP_LEFT);
+    STYGIAN_PUSH_TITLEBAR_ACTION(STYGIAN_TITLEBAR_ACTION_SNAP_RIGHT);
+    STYGIAN_PUSH_TITLEBAR_ACTION(STYGIAN_TITLEBAR_ACTION_SNAP_TOP_LEFT);
+    STYGIAN_PUSH_TITLEBAR_ACTION(STYGIAN_TITLEBAR_ACTION_SNAP_TOP_RIGHT);
+    STYGIAN_PUSH_TITLEBAR_ACTION(STYGIAN_TITLEBAR_ACTION_SNAP_BOTTOM_LEFT);
+    STYGIAN_PUSH_TITLEBAR_ACTION(STYGIAN_TITLEBAR_ACTION_SNAP_BOTTOM_RIGHT);
+  }
+#undef STYGIAN_PUSH_TITLEBAR_ACTION
+  return count;
+}
+
+bool stygian_window_apply_titlebar_menu_action(StygianWindow *win,
+                                               StygianTitlebarMenuAction action) {
+  RECT work_rect;
+  RECT target_rect;
+  LONG half_w;
+  LONG half_h;
+  if (!win || !win->hwnd)
+    return false;
+
+  switch (action) {
+  case STYGIAN_TITLEBAR_ACTION_RESTORE:
+    if (stygian_window_is_fullscreen(win)) {
+      stygian_window_set_fullscreen(win, false);
+    } else {
+      stygian_window_restore(win);
+    }
+    return true;
+  case STYGIAN_TITLEBAR_ACTION_MAXIMIZE:
+    if (stygian_window_is_fullscreen(win)) {
+      stygian_window_set_fullscreen(win, false);
+    }
+    stygian_window_maximize(win);
+    return true;
+  case STYGIAN_TITLEBAR_ACTION_ENTER_FULLSCREEN:
+    stygian_window_set_fullscreen(win, true);
+    return true;
+  case STYGIAN_TITLEBAR_ACTION_EXIT_FULLSCREEN:
+    stygian_window_set_fullscreen(win, false);
+    return true;
+  case STYGIAN_TITLEBAR_ACTION_SNAP_LEFT:
+  case STYGIAN_TITLEBAR_ACTION_SNAP_RIGHT:
+  case STYGIAN_TITLEBAR_ACTION_SNAP_TOP_LEFT:
+  case STYGIAN_TITLEBAR_ACTION_SNAP_TOP_RIGHT:
+  case STYGIAN_TITLEBAR_ACTION_SNAP_BOTTOM_LEFT:
+  case STYGIAN_TITLEBAR_ACTION_SNAP_BOTTOM_RIGHT:
+    break;
+  default:
+    return false;
+  }
+
+  if (!(win->flags & STYGIAN_WINDOW_RESIZABLE))
+    return false;
+  if (!stygian_win32_get_monitor_work_rect(win->hwnd, &work_rect))
+    return false;
+
+  if (stygian_window_is_fullscreen(win)) {
+    stygian_window_set_fullscreen(win, false);
+  }
+
+  half_w = (work_rect.right - work_rect.left) / 2;
+  half_h = (work_rect.bottom - work_rect.top) / 2;
+  target_rect = work_rect;
+
+  switch (action) {
+  case STYGIAN_TITLEBAR_ACTION_SNAP_LEFT:
+    target_rect.right = target_rect.left + half_w;
+    break;
+  case STYGIAN_TITLEBAR_ACTION_SNAP_RIGHT:
+    target_rect.left = target_rect.right - half_w;
+    break;
+  case STYGIAN_TITLEBAR_ACTION_SNAP_TOP_LEFT:
+    target_rect.right = target_rect.left + half_w;
+    target_rect.bottom = target_rect.top + half_h;
+    break;
+  case STYGIAN_TITLEBAR_ACTION_SNAP_TOP_RIGHT:
+    target_rect.left = target_rect.right - half_w;
+    target_rect.bottom = target_rect.top + half_h;
+    break;
+  case STYGIAN_TITLEBAR_ACTION_SNAP_BOTTOM_LEFT:
+    target_rect.right = target_rect.left + half_w;
+    target_rect.top = target_rect.bottom - half_h;
+    break;
+  case STYGIAN_TITLEBAR_ACTION_SNAP_BOTTOM_RIGHT:
+    target_rect.left = target_rect.right - half_w;
+    target_rect.top = target_rect.bottom - half_h;
+    break;
+  default:
+    return false;
+  }
+
+  stygian_win32_apply_window_rect(win->hwnd, &target_rect);
+  win->fullscreen = false;
+  win->borderless_manual_maximized = false;
+  win->maximized = false;
+  win->minimized = false;
+  win->gl_borderless_vsync_suspended = false;
+  win->gl_borderless_present_stall_count = 0u;
+  if ((win->flags & STYGIAN_WINDOW_OPENGL) && win->gl_vsync_requested &&
+      win->gl_swap_control_supported) {
+    win->gl_swap_interval_resync_pending = true;
+  }
+  return true;
 }
 
 void stygian_window_focus(StygianWindow *win) {
@@ -898,16 +1405,65 @@ bool stygian_window_gl_make_current(StygianWindow *win, void *ctx) {
 }
 
 void stygian_window_gl_swap_buffers(StygianWindow *win) {
+  ULONGLONG present_start_ms = 0u;
+  ULONGLONG present_end_ms;
+  double present_ms = 0.0;
+  bool force_dwm_flush;
+  bool borderless_gl_manual;
+  bool watch_present_stall;
+  bool trace_present;
   if (!win || !win->hdc)
     return;
+  if (win->gl_swap_interval_resync_pending && wglSwapIntervalEXT &&
+      win->gl_swap_control_supported) {
+    int interval = win->gl_vsync_requested ? 1 : 0;
+    wglSwapIntervalEXT(interval);
+    win->gl_swap_interval_resync_pending = false;
+  }
+  borderless_gl_manual =
+      ((win->flags & STYGIAN_WINDOW_OPENGL) != 0u) &&
+      ((win->flags & STYGIAN_WINDOW_BORDERLESS) != 0u) &&
+      win->borderless_manual_maximized;
+  watch_present_stall = borderless_gl_manual && win->gl_vsync_requested &&
+                        win->gl_swap_control_supported &&
+                        !win->gl_borderless_vsync_suspended;
+  trace_present = stygian_win32_present_trace_enabled() || watch_present_stall;
+  if (trace_present)
+    present_start_ms = GetTickCount64();
   SwapBuffers(win->hdc);
-  if (stygian_win32_use_dwm_flush()) {
+  force_dwm_flush = stygian_win32_use_dwm_flush() ||
+                    (win->gl_vsync_requested && !win->gl_swap_control_supported);
+  if (force_dwm_flush) {
     DwmFlush();
+  }
+  if (present_start_ms > 0u) {
+    present_end_ms = GetTickCount64();
+    present_ms = (double)(present_end_ms - present_start_ms);
+    if (watch_present_stall) {
+      if (present_ms >= 120.0) {
+        win->gl_borderless_present_stall_count++;
+      } else {
+        win->gl_borderless_present_stall_count = 0u;
+      }
+      if (win->gl_borderless_present_stall_count >= 3u && wglSwapIntervalEXT) {
+        wglSwapIntervalEXT(0);
+        win->gl_borderless_vsync_suspended = true;
+        win->gl_borderless_present_stall_count = 0u;
+        if (stygian_win32_present_trace_enabled()) {
+          printf("[Stygian Win32] present fallback: swap interval forced to 0\n");
+        }
+      }
+    } else if (!borderless_gl_manual) {
+      win->gl_borderless_present_stall_count = 0u;
+    }
+    stygian_win32_trace_long_present(win, present_ms);
   }
 }
 
 void stygian_window_gl_set_vsync(StygianWindow *win, bool enabled) {
-  (void)win;
+  if (!win)
+    return;
+  win->gl_vsync_requested = enabled;
 
   if (!wglSwapIntervalEXT) {
     wglSwapIntervalEXT =
@@ -915,15 +1471,26 @@ void stygian_window_gl_set_vsync(StygianWindow *win, bool enabled) {
   }
 
   if (wglSwapIntervalEXT) {
+    win->gl_swap_control_supported = true;
     wglSwapIntervalEXT(enabled ? 1 : 0);
+    win->gl_borderless_vsync_suspended = false;
+    win->gl_swap_interval_resync_pending = false;
+    win->gl_borderless_present_stall_count = 0u;
   } else {
     HMODULE gl = GetModuleHandle("opengl32.dll");
     if (gl) {
       wglSwapIntervalEXT =
           (PFNWGLSWAPINTERVALEXTPROC)GetProcAddress(gl, "wglSwapIntervalEXT");
-      if (wglSwapIntervalEXT)
+      if (wglSwapIntervalEXT) {
+        win->gl_swap_control_supported = true;
         wglSwapIntervalEXT(enabled ? 1 : 0);
+        win->gl_borderless_vsync_suspended = false;
+        win->gl_swap_interval_resync_pending = false;
+        win->gl_borderless_present_stall_count = 0u;
+        return;
+      }
     }
+    win->gl_swap_control_supported = false;
   }
 }
 

@@ -24,7 +24,39 @@ Optional quick tests:
 
 - Borderless: `compile\windows\build_quickwindow_borderless.bat`
 - Custom titlebar: `compile\windows\build_quickwindow_custom_titlebar.bat`
+- Custom titlebar (Vulkan):
+  `compile\windows\build_quickwindow_custom_titlebar_vk.bat`
 - All quick smoke targets: `compile\windows\build_quick_smoke.bat`
+
+Borderless maximize on Windows is work-area maximize (taskbar remains visible),
+not true fullscreen.
+
+If you want fullscreen-style monitor coverage, that is a different mode and not
+the default maximize behavior.
+
+On Windows, OpenGL borderless main windows keep strict `WS_POPUP` semantics
+with manual maximize/restore sizing in core Win32 code (`window/platform/stygian_win32.c`).
+
+Vulkan borderless path remains unchanged in this iteration.
+
+`quickwindow_custom_titlebar` uses an event-paced loop to avoid maximize hitch
+behavior in unstable OpenGL vsync environments.
+
+Custom-titlebar behavior is now exposed through core APIs:
+
+- `stygian_window_get_titlebar_hints`
+- `stygian_window_set_titlebar_behavior`
+- `stygian_window_begin_system_move`
+- `stygian_window_titlebar_double_click`
+- `stygian_window_get_titlebar_menu_actions`
+- `stygian_window_apply_titlebar_menu_action`
+- `stygian_window_set_fullscreen` / `stygian_window_is_fullscreen`
+
+Default titlebar double-click is maximize/restore. Optional fullscreen toggle
+policy is configurable per window.
+
+Win32 implements these behaviors; non-Windows backends currently expose
+deterministic fallback stubs while native implementations are in progress.
 
 ## Backend Rules (Strict)
 
@@ -43,6 +75,10 @@ For quickwindow:
 
 - Quick-start target: `powershell -File compile/run.ps1 -Target quickwindow`
 - Quick-start Vulkan target: `powershell -File compile/run.ps1 -Target quickwindow_vk`
+- Custom titlebar OpenGL target:
+  `powershell -File compile/run.ps1 -Target quickwindow_custom_titlebar`
+- Custom titlebar Vulkan target:
+  `powershell -File compile/run.ps1 -Target quickwindow_custom_titlebar_vk`
 - Quick smoke group: `powershell -File compile/run.ps1 -Group quick_smoke`
 - Unified Windows target: `powershell -File compile/run.ps1 -Target text_editor_mini`
 - Unified Windows group: `powershell -File compile/run.ps1 -Group mini_apps_all`

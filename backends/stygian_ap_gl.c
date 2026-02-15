@@ -1,6 +1,4 @@
-// stygian_ap_gl.c - OpenGL 4.3+ Access Point Implementation
-// Part of Stygian UI Library
-// DISCIPLINE: Only GPU operations. No layout, no fonts, no hit testing.
+// stygian_ap_gl.c - OpenGL 4.3+ access-point backend
 #include "../include/stygian.h" // Public enums/types shared with AP.
 #include "../include/stygian_memory.h"
 #include "../src/stygian_internal.h" // For SoA struct types

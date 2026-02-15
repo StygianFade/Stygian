@@ -1,6 +1,4 @@
-// stygian_ap_vk.c - Vulkan 1.0+ Access Point Implementation
-// Part of Stygian UI Library
-// DISCIPLINE: Only GPU operations. No layout, no fonts, no hit testing.
+// stygian_ap_vk.c - Vulkan 1.0+ access-point backend
 
 #include "../include/stygian.h"
 #include "../include/stygian_memory.h"

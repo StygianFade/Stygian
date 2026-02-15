@@ -74,6 +74,11 @@
       "entry_source": "examples/quickwindow_custom_titlebar.c",
       "output_stem": "quickwindow_custom_titlebar"
     },
+    "quickwindow_custom_titlebar_vk": {
+      "backend": "vk",
+      "entry_source": "examples/quickwindow_custom_titlebar.c",
+      "output_stem": "quickwindow_custom_titlebar_vk"
+    },
     "tier1_safety": {
       "backend": "gl",
       "entry_source": "tests/tier1_safety.c",

@@ -14,6 +14,10 @@
 struct StygianWindow {
   int width, height;
   bool should_close;
+  bool maximized;
+  bool minimized;
+  bool fullscreen;
+  StygianTitlebarBehavior titlebar_behavior;
   // TODO: X11 handles (Display, Window, GLXContext)
 };
 
@@ -68,21 +72,124 @@ void stygian_window_set_title(StygianWindow *win, const char *title) {
   (void)win;
   (void)title;
 }
-void stygian_window_minimize(StygianWindow *win) { (void)win; }
-void stygian_window_maximize(StygianWindow *win) { (void)win; }
-void stygian_window_restore(StygianWindow *win) { (void)win; }
+void stygian_window_minimize(StygianWindow *win) {
+  if (!win)
+    return;
+  win->minimized = true;
+  win->maximized = false;
+}
+void stygian_window_maximize(StygianWindow *win) {
+  if (!win)
+    return;
+  win->maximized = true;
+  win->minimized = false;
+}
+void stygian_window_restore(StygianWindow *win) {
+  if (!win)
+    return;
+  win->maximized = false;
+  win->minimized = false;
+}
 bool stygian_window_is_maximized(StygianWindow *win) {
-  (void)win;
-  return false;
+  return win ? win->maximized : false;
 }
 bool stygian_window_is_minimized(StygianWindow *win) {
-  (void)win;
-  return false;
+  return win ? win->minimized : false;
+}
+void stygian_window_set_fullscreen(StygianWindow *win, bool enabled) {
+  if (!win)
+    return;
+  win->fullscreen = enabled;
+}
+bool stygian_window_is_fullscreen(StygianWindow *win) {
+  return win ? win->fullscreen : false;
 }
 void stygian_window_focus(StygianWindow *win) { (void)win; }
 bool stygian_window_is_focused(StygianWindow *win) {
   (void)win;
   return false;
+}
+void stygian_window_get_titlebar_hints(StygianWindow *win,
+                                       StygianTitlebarHints *out_hints) {
+  (void)win;
+  if (!out_hints)
+    return;
+  out_hints->button_order = STYGIAN_TITLEBAR_BUTTONS_RIGHT;
+  out_hints->supports_hover_menu = false;
+  out_hints->supports_snap_actions = false;
+  out_hints->recommended_titlebar_height = 36.0f;
+  out_hints->recommended_button_width = 28.0f;
+  out_hints->recommended_button_height = 24.0f;
+  out_hints->recommended_button_gap = 6.0f;
+}
+void stygian_window_set_titlebar_behavior(
+    StygianWindow *win, const StygianTitlebarBehavior *behavior) {
+  if (!win || !behavior)
+    return;
+  win->titlebar_behavior = *behavior;
+}
+void stygian_window_get_titlebar_behavior(StygianWindow *win,
+                                          StygianTitlebarBehavior *out_behavior) {
+  if (!out_behavior)
+    return;
+  out_behavior->double_click_mode = STYGIAN_TITLEBAR_DBLCLICK_MAXIMIZE_RESTORE;
+  out_behavior->hover_menu_enabled = false;
+  if (win)
+    *out_behavior = win->titlebar_behavior;
+}
+bool stygian_window_begin_system_move(StygianWindow *win) {
+  (void)win;
+  return false;
+}
+void stygian_window_titlebar_double_click(StygianWindow *win) {
+  if (!win)
+    return;
+  if (win->titlebar_behavior.double_click_mode ==
+      STYGIAN_TITLEBAR_DBLCLICK_FULLSCREEN_TOGGLE) {
+    win->fullscreen = !win->fullscreen;
+    return;
+  }
+  win->maximized = !win->maximized;
+}
+uint32_t stygian_window_get_titlebar_menu_actions(
+    StygianWindow *win, StygianTitlebarMenuAction *out_actions,
+    uint32_t max_actions) {
+  uint32_t count = 0;
+  if (!win)
+    return 0;
+  if (out_actions && count < max_actions) {
+    out_actions[count] = win->maximized ? STYGIAN_TITLEBAR_ACTION_RESTORE
+                                        : STYGIAN_TITLEBAR_ACTION_MAXIMIZE;
+  }
+  count++;
+  if (out_actions && count < max_actions) {
+    out_actions[count] = win->fullscreen
+                             ? STYGIAN_TITLEBAR_ACTION_EXIT_FULLSCREEN
+                             : STYGIAN_TITLEBAR_ACTION_ENTER_FULLSCREEN;
+  }
+  count++;
+  return count;
+}
+bool stygian_window_apply_titlebar_menu_action(StygianWindow *win,
+                                               StygianTitlebarMenuAction action) {
+  if (!win)
+    return false;
+  switch (action) {
+  case STYGIAN_TITLEBAR_ACTION_RESTORE:
+    stygian_window_restore(win);
+    return true;
+  case STYGIAN_TITLEBAR_ACTION_MAXIMIZE:
+    stygian_window_maximize(win);
+    return true;
+  case STYGIAN_TITLEBAR_ACTION_ENTER_FULLSCREEN:
+    stygian_window_set_fullscreen(win, true);
+    return true;
+  case STYGIAN_TITLEBAR_ACTION_EXIT_FULLSCREEN:
+    stygian_window_set_fullscreen(win, false);
+    return true;
+  default:
+    return false;
+  }
 }
 bool stygian_window_poll_event(StygianWindow *win, StygianEvent *event) {
   (void)win;

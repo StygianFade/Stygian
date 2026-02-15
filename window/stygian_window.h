@@ -40,6 +40,44 @@ typedef enum StygianWindowRole {
   STYGIAN_ROLE_TOOLTIP = 3, // Tooltip / Overlay (no focus)
 } StygianWindowRole;
 
+typedef enum StygianTitlebarButtonOrder {
+  STYGIAN_TITLEBAR_BUTTONS_RIGHT = 0,
+  STYGIAN_TITLEBAR_BUTTONS_LEFT = 1,
+} StygianTitlebarButtonOrder;
+
+typedef enum StygianTitlebarDoubleClickMode {
+  STYGIAN_TITLEBAR_DBLCLICK_MAXIMIZE_RESTORE = 0,
+  STYGIAN_TITLEBAR_DBLCLICK_FULLSCREEN_TOGGLE = 1,
+} StygianTitlebarDoubleClickMode;
+
+typedef enum StygianTitlebarMenuAction {
+  STYGIAN_TITLEBAR_ACTION_RESTORE = 0,
+  STYGIAN_TITLEBAR_ACTION_MAXIMIZE = 1,
+  STYGIAN_TITLEBAR_ACTION_ENTER_FULLSCREEN = 2,
+  STYGIAN_TITLEBAR_ACTION_EXIT_FULLSCREEN = 3,
+  STYGIAN_TITLEBAR_ACTION_SNAP_LEFT = 4,
+  STYGIAN_TITLEBAR_ACTION_SNAP_RIGHT = 5,
+  STYGIAN_TITLEBAR_ACTION_SNAP_TOP_LEFT = 6,
+  STYGIAN_TITLEBAR_ACTION_SNAP_TOP_RIGHT = 7,
+  STYGIAN_TITLEBAR_ACTION_SNAP_BOTTOM_LEFT = 8,
+  STYGIAN_TITLEBAR_ACTION_SNAP_BOTTOM_RIGHT = 9,
+} StygianTitlebarMenuAction;
+
+typedef struct StygianTitlebarHints {
+  StygianTitlebarButtonOrder button_order;
+  bool supports_hover_menu;
+  bool supports_snap_actions;
+  float recommended_titlebar_height;
+  float recommended_button_width;
+  float recommended_button_height;
+  float recommended_button_gap;
+} StygianTitlebarHints;
+
+typedef struct StygianTitlebarBehavior {
+  StygianTitlebarDoubleClickMode double_click_mode;
+  bool hover_menu_enabled;
+} StygianTitlebarBehavior;
+
 typedef struct StygianWindowConfig {
   int width, height;
   const char *title;
@@ -95,9 +133,25 @@ void stygian_window_maximize(StygianWindow *win);
 void stygian_window_restore(StygianWindow *win);
 bool stygian_window_is_maximized(StygianWindow *win);
 bool stygian_window_is_minimized(StygianWindow *win);
+void stygian_window_set_fullscreen(StygianWindow *win, bool enabled);
+bool stygian_window_is_fullscreen(StygianWindow *win);
 
 void stygian_window_focus(StygianWindow *win);
 bool stygian_window_is_focused(StygianWindow *win);
+
+void stygian_window_get_titlebar_hints(StygianWindow *win,
+                                       StygianTitlebarHints *out_hints);
+void stygian_window_set_titlebar_behavior(StygianWindow *win,
+                                          const StygianTitlebarBehavior *behavior);
+void stygian_window_get_titlebar_behavior(StygianWindow *win,
+                                          StygianTitlebarBehavior *out_behavior);
+bool stygian_window_begin_system_move(StygianWindow *win);
+void stygian_window_titlebar_double_click(StygianWindow *win);
+uint32_t stygian_window_get_titlebar_menu_actions(
+    StygianWindow *win, StygianTitlebarMenuAction *out_actions,
+    uint32_t max_actions);
+bool stygian_window_apply_titlebar_menu_action(StygianWindow *win,
+                                               StygianTitlebarMenuAction action);
 
 // ============================================================================
 // Event Processing
